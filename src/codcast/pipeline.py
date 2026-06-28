@@ -27,6 +27,21 @@ from .voices import backend_for_quality, build_speaker_specs, select_voice_profi
 
 
 TTS_LINE_CHAR_LIMIT = 220
+SAFE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}")
+
+
+def _safe_output_stem(run_id: str, *, source: str = "run_id") -> str:
+    value = run_id.strip()
+    path = Path(value)
+    if (
+        not value
+        or path.is_absolute()
+        or path.name != value
+        or value in {".", ".."}
+        or not SAFE_RUN_ID_RE.fullmatch(value)
+    ):
+        raise ValueError(f"Unsafe {source}: {run_id!r}")
+    return value
 
 
 class PodcastGenerator:
@@ -189,7 +204,7 @@ class PodcastGenerator:
         else:
             raise FileNotFoundError(f"No inputs.json or manifest.json found at {run_dir}")
 
-        run_id = manifest.run_id or run_dir.name
+        run_id = _safe_output_stem(manifest.run_id or run_dir.name)
         topic = manifest.topic
         language = manifest.language
         selected_research_depth = manifest.research_depth

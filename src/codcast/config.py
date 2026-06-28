@@ -75,6 +75,7 @@ class EvidenceConfig(ConfigModel):
     yt_dlp_executable: str = "yt-dlp"
     preferred_subtitle_languages: list[str] = Field(default_factory=lambda: ["de.*", "de", "en.*", "en"])
     max_youtube_urls: int = 8
+    max_subtitle_bytes: int = 2_000_000
     max_transcript_chars: int = 45000
     max_total_transcript_chars: int = 120000
     timeout_sec: int = 240
@@ -113,6 +114,7 @@ class OpenAIConfig(ConfigModel):
     voice: str = "cedar"
     response_format: Literal["wav"] = "wav"
     max_input_chars: int = 3800
+    max_output_bytes: int = 50_000_000
     concurrency: int = 4
     instructions: str = (
         "Sprich natuerlich, ruhig und praezise auf Deutsch. "
@@ -133,6 +135,7 @@ class FishConfig(ConfigModel):
     output_format: Literal["wav", "mp3", "opus"] = "wav"
     latency: Literal["normal", "balanced"] = "normal"
     max_new_tokens: int = 192
+    max_output_bytes: int = 50_000_000
     chunk_length: int = 120
     top_p: float = 0.8
     repetition_penalty: float = 1.1

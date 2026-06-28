@@ -211,14 +211,34 @@ class SearxngResearchProvider:
         url = _normalize_result_url(url)
         if not _is_fetchable_url(url, allow_private_networks=self.allow_private_networks):
             return None
+        redirects = 0
         try:
-            response = self.session.get(url, timeout=self.timeout_sec, allow_redirects=True, stream=True)
+            while True:
+                response = self.session.get(url, timeout=self.timeout_sec, allow_redirects=False, stream=True)
+                if response.is_redirect or response.is_permanent_redirect:
+                    location = response.headers.get("location")
+                    response.close()
+                    if not location:
+                        return None
+                    redirects += 1
+                    if redirects > 5:
+                        return None
+                    url = _normalize_result_url(urljoin(url, location))
+                    if not _is_fetchable_url(url, allow_private_networks=self.allow_private_networks):
+                        return None
+                    continue
+                break
         except requests.RequestException:
             return None
+        if not _is_fetchable_url(response.url, allow_private_networks=self.allow_private_networks):
+            response.close()
+            return None
         if response.status_code >= 400:
+            response.close()
             return None
         content_type = response.headers.get("content-type", "").lower()
         if content_type and not any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml")):
+            response.close()
             return None
         body = bytearray()
         try:

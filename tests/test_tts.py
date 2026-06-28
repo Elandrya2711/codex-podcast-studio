@@ -83,13 +83,19 @@ def test_api_key_from_env_file_accepts_raw_key(tmp_path, monkeypatch):
 def test_openai_backend_posts_speech_request(tmp_path, monkeypatch):
     class FakeResponse:
         status_code = 200
-        content = b"wav-bytes"
         text = ""
+        headers = {}
+
+        def iter_content(self, chunk_size):
+            yield b"wav-bytes"
+
+        def close(self):
+            pass
 
     calls = []
 
-    def fake_post(url, *, json, headers, timeout):
-        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+    def fake_post(url, *, json, headers, timeout, stream):
+        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout, "stream": stream})
         return FakeResponse()
 
     config = load_config(tmp_path / "missing.yml")
@@ -108,6 +114,42 @@ def test_openai_backend_posts_speech_request(tmp_path, monkeypatch):
     assert calls[0]["json"]["input"] == "Hallo Welt."
     assert calls[0]["json"]["response_format"] == "wav"
     assert calls[0]["headers"]["authorization"] == "Bearer fake-key"
+    assert calls[0]["stream"] is True
+
+
+def test_openai_backend_rejects_oversized_speech_response(tmp_path, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def iter_content(self, chunk_size):
+            yield b"a" * 8
+            yield b"b" * 8
+
+        def close(self):
+            pass
+
+    def fake_post(url, *, json, headers, timeout, stream):
+        return FakeResponse()
+
+    config = load_config(tmp_path / "missing.yml")
+    config.tts.openai.max_output_bytes = 10
+    config.tts.openai.env_file = tmp_path / ".env.tts.local"
+    config.tts.openai.env_file.write_text("OPENAI_TTS_API_KEY=fake-key\n", encoding="utf-8")
+    voice = next(item for item in config.tts.voices if item.backend == "openai")
+    monkeypatch.setattr("requests.post", fake_post)
+    output = tmp_path / "out.wav"
+
+    try:
+        OpenAIBackend(config).render("Hallo Welt.", voice, output)
+    except RuntimeError as exc:
+        assert "exceeded" in str(exc)
+    else:
+        raise AssertionError("expected oversized TTS response to fail")
+
+    assert not output.exists()
+    assert not (tmp_path / "out.wav.tmp").exists()
 
 
 def test_openai_single_speaker_lines_are_grouped_without_labels(tmp_path):

@@ -36,6 +36,37 @@ class TTSBackend:
         raise NotImplementedError
 
 
+def _write_bounded_response(response: object, output_path: Path, *, max_bytes: int, label: str) -> None:
+    content_length = getattr(response, "headers", {}).get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            declared_size = None
+        if declared_size is not None and declared_size > max_bytes:
+            raise RuntimeError(f"{label} response too large: {declared_size} bytes (limit {max_bytes})")
+
+    written = 0
+    tmp_path = output_path.with_name(f"{output_path.name}.tmp")
+    try:
+        with tmp_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > max_bytes:
+                    raise RuntimeError(f"{label} response exceeded {max_bytes} bytes")
+                handle.write(chunk)
+        tmp_path.replace(output_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
 class KokoroBackend(TTSBackend):
     sample_rate = 24000
 
@@ -154,11 +185,13 @@ class OpenAIBackend(TTSBackend):
                 "content-type": "application/json",
             },
             timeout=openai_config.timeout_sec,
+            stream=True,
         )
         if response.status_code != 200:
             detail = response.text[:1000]
+            response.close()
             raise RuntimeError(f"OpenAI TTS request failed with HTTP {response.status_code}: {detail}")
-        output_path.write_bytes(response.content)
+        _write_bounded_response(response, output_path, max_bytes=openai_config.max_output_bytes, label="OpenAI TTS")
 
 
 class FishBackend(TTSBackend):
@@ -191,11 +224,13 @@ class FishBackend(TTSBackend):
             data=ormsgpack.packb(payload),
             headers=headers,
             timeout=self.config.tts.fish.timeout_sec,
+            stream=True,
         )
         if response.status_code != 200:
             detail = response.text[:1000]
+            response.close()
             raise RuntimeError(f"Fish TTS request failed with HTTP {response.status_code}: {detail}")
-        output_path.write_bytes(response.content)
+        _write_bounded_response(response, output_path, max_bytes=self.config.tts.fish.max_output_bytes, label="Fish TTS")
 
 
 def backend_for_voice(config: AppConfig, voice: VoiceProfile) -> TTSBackend:

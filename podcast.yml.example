@@ -41,6 +41,7 @@ evidence:
   - en.*
   - en
   max_youtube_urls: 8
+  max_subtitle_bytes: 2000000
   max_transcript_chars: 45000
   max_total_transcript_chars: 120000
   timeout_sec: 240
@@ -63,6 +64,7 @@ tts:
     voice: cedar
     response_format: wav
     max_input_chars: 3800
+    max_output_bytes: 50000000
     concurrency: 4
     instructions: Sprich natuerlich, ruhig und praezise auf Deutsch. Der Stil ist ein
       moderner, gut verstaendlicher Podcast.
@@ -82,6 +84,7 @@ tts:
     output_format: wav
     latency: normal
     max_new_tokens: 192
+    max_output_bytes: 50000000
     chunk_length: 120
     top_p: 0.8
     repetition_penalty: 1.1

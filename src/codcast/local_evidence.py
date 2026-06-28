@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -182,23 +183,31 @@ class LocalEvidenceCollector:
             cmd.extend(["--cookies-from-browser", self.config.cookies_from_browser])
         cmd.append(url)
 
-        result = subprocess.run(
-            cmd,
-            cwd=str(self.project_root),
-            text=True,
-            capture_output=True,
-            timeout=self.config.timeout_sec,
-        )
-        (evidence_root / "yt-dlp.stdout.log").write_text(result.stdout, encoding="utf-8")
-        (evidence_root / "yt-dlp.stderr.log").write_text(result.stderr, encoding="utf-8")
+        stdout_path = evidence_root / "yt-dlp.stdout.log"
+        stderr_path = evidence_root / "yt-dlp.stderr.log"
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+            result = subprocess.run(
+                cmd,
+                cwd=str(self.project_root),
+                text=True,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=self.config.timeout_sec,
+            )
         if result.returncode != 0:
-            detail = self._stderr_summary(result.stderr)
+            detail = self._stderr_summary(stderr_path)
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"yt-dlp failed with exit code {result.returncode}{suffix}")
 
         transcript_file = self._select_transcript_file(evidence_root)
         if transcript_file is None:
             raise RuntimeError("yt-dlp did not download subtitles for the preferred languages")
+        subtitle_size = transcript_file.stat().st_size
+        if subtitle_size > self.config.max_subtitle_bytes:
+            raise RuntimeError(
+                f"subtitle file is too large: {subtitle_size} bytes "
+                f"(limit {self.config.max_subtitle_bytes})"
+            )
 
         transcript = vtt_to_plain_text(transcript_file.read_text(encoding="utf-8", errors="replace"))
         if not transcript.strip():
@@ -250,17 +259,18 @@ class LocalEvidenceCollector:
         info_files = sorted(root.glob("*.info.json"))
         if not info_files:
             return {}
+        try:
+            return json.loads(info_files[0].read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
 
-    def _stderr_summary(self, stderr: str) -> str:
+    def _stderr_summary(self, stderr_path: Path) -> str:
+        stderr = _read_tail_text(stderr_path, max_bytes=16_384)
         lines = [line.strip() for line in stderr.splitlines() if line.strip()]
         for line in reversed(lines):
             if line.startswith(("ERROR:", "WARNING:")):
                 return line[:500]
         return " ".join(lines[-3:])[:500]
-        try:
-            return json.loads(info_files[0].read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
 
     def _format_upload_date(self, value: object) -> str | None:
         if not isinstance(value, str) or not re.fullmatch(r"\d{8}", value):
@@ -289,3 +299,14 @@ class LocalEvidenceCollector:
             for failure in report.failures:
                 lines.append(f"- {failure.url}: {failure.reason}")
         (run_dir / "local_evidence.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_tail_text(path: Path, *, max_bytes: int) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(-max_bytes, os.SEEK_END)
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""

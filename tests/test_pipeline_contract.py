@@ -1,6 +1,7 @@
 import re
 
 from codcast.config import load_config
+from codcast.models import RunManifest
 from codcast.models import PodcastScript, ScriptLine
 from codcast.pipeline import PodcastGenerator
 from codcast.voices import build_speaker_specs, select_voice_profiles
@@ -75,3 +76,26 @@ def test_normalize_script_splits_long_tts_lines(tmp_path):
     assert all(len(line.text) <= 220 for line in normalized.lines)
     assert all(line.speaker_id == "s1" for line in normalized.lines)
     assert all(line.claim_ids == ["C1"] for line in normalized.lines)
+
+
+def test_resume_rejects_manifest_run_id_path_traversal(tmp_path):
+    config = load_config(tmp_path / "missing.yml")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    manifest = RunManifest(
+        run_id="../../outside/pwn",
+        topic="Thema",
+        language="de-DE",
+        min_minutes=1,
+        max_minutes=2,
+        speakers=1,
+        quality="best",
+    )
+    (run_dir / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+
+    try:
+        PodcastGenerator(config, tmp_path).resume(run_dir=run_dir, render_audio=False)
+    except ValueError as exc:
+        assert "Unsafe run_id" in str(exc)
+    else:
+        raise AssertionError("expected unsafe run_id to fail")
