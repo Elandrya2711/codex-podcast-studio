@@ -1,0 +1,63 @@
+Codex Podcast Studio Non-Commercial Upstream License 1.0
+
+Copyright (c) 2026 Elandrya2711
+
+Official upstream project:
+https://github.com/Elandrya2711/codex-podcast-studio
+
+1. Grant of rights
+
+You may use, copy, inspect, modify, and share this software and your
+modifications for non-commercial purposes only, subject to the conditions below.
+
+2. Non-commercial use only
+
+Commercial use is not permitted without prior written permission from
+Elandrya2711. Commercial use includes, but is not limited to, selling the
+software, offering it as a paid service, using it to provide paid services,
+integrating it into a commercial product, or using it primarily for commercial
+advantage.
+
+3. Upstream contribution requirement
+
+If you modify, extend, fork, adapt, or otherwise improve this software and share
+or deploy that modified version outside your own private personal environment,
+you must make the complete corresponding changes available to the official
+upstream project by submitting a pull request or patch to:
+
+https://github.com/Elandrya2711/codex-podcast-studio
+
+This requirement applies whether the changes are distributed as source code,
+executed as a hosted service, used in an internal shared environment, or made
+available to others in another form.
+
+4. Same terms for modifications
+
+Any shared or deployed modified version must remain under this license. You may
+not remove this license, remove copyright notices, or apply additional terms
+that prevent recipients from exercising the non-commercial rights granted here.
+
+5. Attribution
+
+Copies, forks, and modified versions must retain this license and must identify
+the official upstream project listed above.
+
+6. Third-party materials
+
+This license applies only to the project files authored for Codex Podcast
+Studio. Third-party dependencies, models, voice samples, generated podcast
+outputs, datasets, and external services remain subject to their own licenses
+and terms.
+
+7. No warranty
+
+This software is provided "as is", without warranty of any kind, express or
+implied, including but not limited to warranties of merchantability, fitness for
+a particular purpose, and non-infringement. In no event shall the copyright
+holder be liable for any claim, damages, or other liability arising from the
+software or its use.
+
+8. Permission for commercial use
+
+For commercial licensing or exceptions, contact the rights holder through the
+official upstream project.

@@ -1,0 +1,15 @@
+Codex Podcast Studio
+
+Rights holder: Elandrya2711
+Official upstream: https://github.com/Elandrya2711/codex-podcast-studio
+
+Codex Podcast Studio is source-available for non-commercial use under the
+Codex Podcast Studio Non-Commercial Upstream License 1.0.
+
+Any modifications, forks, adaptations, or improvements that are shared or
+deployed outside a private personal environment must be returned to the official
+upstream project as a pull request or patch.
+
+Generated podcast outputs, local configuration files, API keys, voice samples,
+models, and third-party dependencies are not covered by this notice unless
+explicitly stated otherwise in their own files or licenses.

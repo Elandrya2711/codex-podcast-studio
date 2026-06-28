@@ -1,0 +1,144 @@
+language: de-DE
+output_root: podcasts
+codex:
+  executable: codex
+  model: null
+  live_search: true
+  sandbox: read-only
+  approval_policy: never
+  timeout_sec: 1200
+  extra_args: []
+generation:
+  words_per_minute: 145
+  rewrite_attempts: 2
+  max_speakers: 6
+  pause_between_lines_sec: 0.28
+research:
+  depth: standard
+  provider: searxng
+  searxng_base_url: http://127.0.0.1:8888
+  searxng_categories: general,news,science
+  searxng_language: auto
+  max_minutes: null
+  max_rounds: null
+  max_documents: null
+  per_query_results: 10
+  queries_per_round: 4
+  extraction_batch_size: 8
+  codex_batch_chars: 24000
+  crawl_high_authority_domains: false
+  timeout_sec: 60
+  max_fetch_bytes: 2000000
+  user_agent: codex-podcast-studio/0.1 (+local research pipeline)
+  allow_private_networks: false
+evidence:
+  enabled: true
+  youtube_enabled: true
+  yt_dlp_executable: yt-dlp
+  preferred_subtitle_languages:
+  - de.*
+  - de
+  - en.*
+  - en
+  max_youtube_urls: 8
+  max_transcript_chars: 45000
+  max_total_transcript_chars: 120000
+  timeout_sec: 240
+  cookies_from_browser: null
+audio:
+  sample_rate: 44100
+  channels: 1
+  wav_loudnorm: true
+  mp3_bitrate: 192k
+tts:
+  quality: best
+  backend: openai
+  language: de
+  allow_voice_reuse: false
+  openai:
+    env_file: .env.tts.local
+    api_key_env: OPENAI_TTS_API_KEY
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini-tts
+    voice: cedar
+    response_format: wav
+    max_input_chars: 3800
+    concurrency: 4
+    instructions: Sprich natuerlich, ruhig und praezise auf Deutsch. Der Stil ist ein
+      moderner, gut verstaendlicher Podcast.
+    timeout_sec: 600
+  kokoro:
+    lang_code: de
+    device: cuda
+    config_path: models/kokoro/config.json
+  xtts:
+    gpu: true
+    model_name: tts_models/multilingual/multi-dataset/xtts_v2
+    accept_cpml_noncommercial: false
+  fish:
+    server_url: http://127.0.0.1:8098/v1/tts
+    api_key: null
+    api_key_env: FISH_AUDIO_API_KEY
+    output_format: wav
+    latency: normal
+    max_new_tokens: 192
+    chunk_length: 120
+    top_p: 0.8
+    repetition_penalty: 1.1
+    temperature: 0.8
+    seed: null
+    timeout_sec: 600
+    use_memory_cache: 'on'
+  voices:
+  - id: openai-cedar
+    display_name: Cedar
+    backend: openai
+    language: de-DE
+    license: openai-api
+    openai_voice: cedar
+    openai_instructions: Sprich als ruhiger deutscher Podcast-Host, klar, konzentriert,
+      natuerlich und ohne uebertriebene Emotion.
+    speed: 1.0
+  - id: openai-marin
+    display_name: Marin
+    backend: openai
+    language: de-DE
+    license: openai-api
+    openai_voice: marin
+    openai_instructions: Sprich als analytische deutsche Podcast-Stimme, warm, praezise
+      und mit sauberer Betonung technischer Begriffe.
+    speed: 1.0
+  - id: fish-host-m
+    display_name: Jonas
+    backend: fish
+    language: de-DE
+    license: private
+    speaker_wav: voices/fish/host-m.wav
+    ref_text: Willkommen im Podcast Studio. Heute sprechen wir ruhig und praezise
+      ueber Twitch, YouTube, Anny the Duck und die Dynamik in Online-Communitys.
+    speed: 1.0
+  - id: fish-host-f
+    display_name: Mara
+    backend: fish
+    language: de-DE
+    license: private
+    speaker_wav: voices/fish/host-f.wav
+    ref_text: Ich ordne die Fakten ein, stelle kritische Nachfragen und achte darauf,
+      dass englische Begriffe wie Twitch, YouTube und Stream sauber klingen.
+    speed: 1.0
+  - id: martin
+    display_name: Martin
+    backend: kokoro
+    language: de-DE
+    license: apache-2.0
+    kokoro_model: models/kokoro/martin/kikiri_german_martin_ep10.pth
+    kokoro_voice: models/kokoro/martin/voices/martin.pt
+    speed: 1.0
+  - id: victoria
+    display_name: Victoria
+    backend: kokoro
+    language: de-DE
+    license: apache-2.0
+    kokoro_model: models/kokoro/victoria/kikiri_german_victoria_ep10.pth
+    kokoro_voice: models/kokoro/victoria/voices/victoria.pt
+    speed: 1.0
