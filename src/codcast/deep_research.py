@@ -34,6 +34,15 @@ from .util import write_json
 T = TypeVar("T")
 
 
+RECOVERABLE_PROVIDER_ERROR_CODES = {
+    "local_search_unavailable",
+    "searxng_json_disabled",
+    "searxng_invalid_json",
+    "local_search_error",
+    "provider_rate_limited",
+}
+
+
 @dataclass(frozen=True)
 class ResearchLimits:
     max_seconds: float
@@ -85,6 +94,9 @@ class SearxngResearchProvider:
         self.allow_private_networks = config.research.allow_private_networks
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.research.user_agent})
+
+    def check_available(self) -> None:
+        self._search_json("codex-podcast-studio healthcheck", 1)
 
     def search(self, query: str, *, max_results: int, depth: str) -> list[WebResult]:
         wanted = max(1, max_results)
@@ -296,8 +308,14 @@ class DeepResearchEngine:
         warnings: list[str] = []
 
         provider = self.provider or SearxngResearchProvider(self.config)
-        plan = self._plan(topic, language, run_dir, progress=progress, cancellation=cancellation)
-        frontier = self._initial_frontier(plan, topic)
+        provider_failure = self._optional_provider_failure(provider, progress)
+        if provider_failure is None:
+            plan = self._plan(topic, language, run_dir, progress=progress, cancellation=cancellation)
+            frontier = self._initial_frontier(plan, topic)
+        else:
+            warnings.extend([provider_failure.code, "local_web_search_skipped"])
+            plan = self._skipped_provider_plan(topic, language, run_dir, provider_failure)
+            frontier = deque()
         seen_queries = {_normalize_query(query.query) for query in frontier}
         seen_urls: set[str] = set()
         documents: list[DeepResearchDocument] = []
@@ -335,13 +353,14 @@ class DeepResearchEngine:
                 self._append_jsonl(research_root / "evidence.jsonl", batch.model_dump(mode="json"))
                 for discovered in batch.discovered_topics:
                     self._merge_topic(discovered, known_topics)
-                for query in self._follow_up_queries(batch):
-                    normalized = _normalize_query(query.query)
-                    if normalized and normalized not in seen_queries:
-                        frontier.append(query)
-                        seen_queries.add(normalized)
+                if provider_failure is None:
+                    for query in self._follow_up_queries(batch):
+                        normalized = _normalize_query(query.query)
+                        if normalized and normalized not in seen_queries:
+                            frontier.append(query)
+                            seen_queries.add(normalized)
 
-        if self.config.research.crawl_high_authority_domains and plan.crawl_urls:
+        if provider_failure is None and self.config.research.crawl_high_authority_domains and plan.crawl_urls:
             crawled_documents = self._collect_crawl_documents(
                 provider,
                 plan,
@@ -402,8 +421,22 @@ class DeepResearchEngine:
                 )
             except ResearchProviderError as exc:
                 warnings.append(exc.code)
-                if exc.code == "provider_rate_limited":
-                    warnings.append("provider_rate_limited")
+                if exc.code in RECOVERABLE_PROVIDER_ERROR_CODES:
+                    provider_failure = exc
+                    warnings.append("local_web_search_skipped")
+                    report_progress(
+                        progress,
+                        ProgressEvent(
+                            "log",
+                            "research",
+                            f"Lokale Websuche fuer diesen Lauf deaktiviert: {exc}",
+                            level="warning",
+                        ),
+                    )
+                    self._write_frontier(
+                        research_root,
+                        [{"event": "provider_disabled", "code": exc.code, "message": str(exc)}],
+                    )
                     break
                 raise RuntimeError(str(exc)) from exc
             self._write_frontier(
@@ -434,6 +467,11 @@ class DeepResearchEngine:
             report_progress(progress, ProgressEvent("done", "research", f"Tiefenrecherche Runde {round_index} abgeschlossen"))
 
         if not documents:
+            if provider_failure is not None:
+                raise ResearchProviderError(
+                    "Lokale Websuche wurde uebersprungen und es gab keine lokalen Belege fuer die Tiefenrecherche.",
+                    code=provider_failure.code,
+                ) from provider_failure
             raise RuntimeError("Tiefenrecherche hat keine Webdokumente gefunden.")
 
         if time.monotonic() >= deadline:
@@ -522,6 +560,50 @@ class DeepResearchEngine:
             live_search=False,
         )
         report_progress(progress, ProgressEvent("done", "research", f"Rechercheplan mit {len(plan.seed_queries)} Queries erstellt"))
+        return plan
+
+    def _optional_provider_failure(
+        self,
+        provider: ResearchProvider,
+        progress: ProgressReporter | None,
+    ) -> ResearchProviderError | None:
+        check_available = getattr(provider, "check_available", None)
+        if check_available is None:
+            return None
+        try:
+            check_available()
+        except ResearchProviderError as exc:
+            if exc.code not in RECOVERABLE_PROVIDER_ERROR_CODES:
+                raise
+            report_progress(
+                progress,
+                ProgressEvent(
+                    "log",
+                    "research",
+                    f"Lokale Websuche nicht verfuegbar; SearXNG wird uebersprungen: {exc}",
+                    level="warning",
+                ),
+            )
+            return exc
+        return None
+
+    def _skipped_provider_plan(
+        self,
+        topic: str,
+        language: str,
+        run_dir: Path,
+        provider_failure: ResearchProviderError,
+    ) -> DeepResearchPlan:
+        plan = DeepResearchPlan(
+            topic=topic,
+            language=language,
+            perspectives=[],
+            seed_queries=[],
+            crawl_urls=[],
+            source_priorities=[],
+            stop_criteria=[f"Lokale Websuche deaktiviert: {provider_failure.code}"],
+        )
+        write_json(run_dir / "research_plan.json", plan.model_dump(mode="json"))
         return plan
 
     def _collect_crawl_documents(

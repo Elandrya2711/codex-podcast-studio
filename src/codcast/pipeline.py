@@ -7,7 +7,7 @@ from pathlib import Path
 from .audio import assemble_episode
 from .codex_runner import CodexRunner
 from .config import AppConfig, config_to_yaml
-from .deep_research import DeepResearchEngine
+from .deep_research import DeepResearchEngine, ResearchProviderError
 from .duration import duration_status, script_word_count
 from .local_evidence import LocalEvidenceCollector
 from .models import LocalEvidenceReport, PodcastScript, ResearchReport, RunManifest, ScriptLine, ValidationReport
@@ -123,48 +123,58 @@ class PodcastGenerator:
         deep_artifacts: dict[str, Path] = {}
         local_research_only = selected_research_depth != "standard"
         if selected_research_depth == "standard":
-            report_progress(progress, ProgressEvent("start", "research", "Recherche mit Codex starten"))
-            research = self.runner.run_structured(
-                prompt=build_research_prompt(topic, language, local_evidence),
-                schema_name="research",
-                output_path=run_dir / "research_initial.json",
-                model=ResearchReport,
-                progress=progress,
-                cancellation=cancellation,
-            )
-            report_progress(progress, ProgressEvent("done", "research", "Erste Recherche abgeschlossen"))
+            research = self._run_standard_research(topic, language, local_evidence, run_dir, progress, cancellation)
         else:
             report_progress(progress, ProgressEvent("start", "research", f"Tiefenrecherche starten: {selected_research_depth}"))
-            deep_result = DeepResearchEngine(self.config, self.runner, self.project_root).run(
-                topic=topic,
-                language=language,
-                run_dir=run_dir,
-                local_evidence=local_evidence,
-                progress=progress,
-                cancellation=cancellation,
-            )
-            for warning in deep_result.warnings:
-                self._append_warning(manifest, warning)
-            deep_artifacts = deep_result.artifacts
-            report_progress(progress, ProgressEvent("start", "research", "Finale Recherche aus Dossier erstellen"))
-            research = self.runner.run_structured(
-                prompt=build_research_from_dossier_prompt(
-                    topic,
-                    language,
-                    deep_result.dossier,
-                    deep_result.documents,
-                    local_evidence,
-                ),
-                schema_name="research",
-                output_path=run_dir / "research_initial.json",
-                model=ResearchReport,
-                progress=progress,
-                cancellation=cancellation,
-                timeout_sec=max(self.config.codex.timeout_sec, 2400),
-                config_overrides={"model_reasoning_effort": "xhigh"},
-                live_search=False,
-            )
-            report_progress(progress, ProgressEvent("done", "research", "Finale Recherche aus Dossier erstellt"))
+            try:
+                deep_result = DeepResearchEngine(self.config, self.runner, self.project_root).run(
+                    topic=topic,
+                    language=language,
+                    run_dir=run_dir,
+                    local_evidence=local_evidence,
+                    progress=progress,
+                    cancellation=cancellation,
+                )
+            except ResearchProviderError as exc:
+                self._append_warning(manifest, exc.code)
+                self._append_warning(manifest, "deep_research_fallback_standard")
+                manifest.research_depth = "standard"
+                selected_research_depth = "standard"
+                self.config.research.depth = "standard"
+                local_research_only = False
+                report_progress(
+                    progress,
+                    ProgressEvent(
+                        "log",
+                        "research",
+                        f"Tiefenrecherche ohne lokale Websuche nicht moeglich; normale Recherche wird genutzt: {exc}",
+                        level="warning",
+                    ),
+                )
+                research = self._run_standard_research(topic, language, local_evidence, run_dir, progress, cancellation)
+            else:
+                for warning in deep_result.warnings:
+                    self._append_warning(manifest, warning)
+                deep_artifacts = deep_result.artifacts
+                report_progress(progress, ProgressEvent("start", "research", "Finale Recherche aus Dossier erstellen"))
+                research = self.runner.run_structured(
+                    prompt=build_research_from_dossier_prompt(
+                        topic,
+                        language,
+                        deep_result.dossier,
+                        deep_result.documents,
+                        local_evidence,
+                    ),
+                    schema_name="research",
+                    output_path=run_dir / "research_initial.json",
+                    model=ResearchReport,
+                    progress=progress,
+                    cancellation=cancellation,
+                    timeout_sec=max(self.config.codex.timeout_sec, 2400),
+                    config_overrides={"model_reasoning_effort": "xhigh"},
+                    live_search=False,
+                )
+                report_progress(progress, ProgressEvent("done", "research", "Finale Recherche aus Dossier erstellt"))
         return self._continue_after_research(
             run_id=run_id,
             run_dir=run_dir,
@@ -185,6 +195,27 @@ class PodcastGenerator:
             progress=progress,
             cancellation=cancellation,
         )
+
+    def _run_standard_research(
+        self,
+        topic: str,
+        language: str,
+        local_evidence: LocalEvidenceReport,
+        run_dir: Path,
+        progress: ProgressReporter | None,
+        cancellation: CancellationToken | None,
+    ) -> ResearchReport:
+        report_progress(progress, ProgressEvent("start", "research", "Recherche mit Codex starten"))
+        research = self.runner.run_structured(
+            prompt=build_research_prompt(topic, language, local_evidence),
+            schema_name="research",
+            output_path=run_dir / "research_initial.json",
+            model=ResearchReport,
+            progress=progress,
+            cancellation=cancellation,
+        )
+        report_progress(progress, ProgressEvent("done", "research", "Erste Recherche abgeschlossen"))
+        return research
 
     def resume(
         self,

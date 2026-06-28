@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from codcast.config import load_config
-from codcast.deep_research import DeepResearchEngine, SearxngResearchProvider, WebResult
+from codcast.deep_research import DeepResearchEngine, ResearchProviderError, SearxngResearchProvider, WebResult
 from codcast.prompts import build_evidence_batch_prompt, build_research_dossier_prompt
 from codcast.models import (
     DeepResearchDocument,
@@ -340,6 +340,85 @@ def test_deep_research_adds_youtube_transcripts_to_dossier_documents(tmp_path: P
     assert result.documents[0].query == "youtube_transcript:E1"
     assert "belegbarer Aussage" in result.documents[0].content
     assert (run_dir / "deep_research" / "documents" / "D0001.json").exists()
+
+
+def test_deep_research_skips_unavailable_search_with_local_documents(tmp_path: Path):
+    class UnavailableProvider(FakeProvider):
+        def check_available(self):
+            raise ResearchProviderError("offline", code="local_search_unavailable")
+
+        def search(self, query: str, *, max_results: int, depth: str):
+            raise AssertionError("search should be skipped when provider is unavailable")
+
+        def crawl(self, url: str, *, instructions: str, limit: int, depth: str):
+            raise AssertionError("crawl should be skipped when provider is unavailable")
+
+    config = load_config(tmp_path / "missing.yml")
+    config.research.depth = "deep"
+    config.research.max_minutes = 1
+    config.research.max_rounds = 1
+    config.research.max_documents = 1
+    provider = UnavailableProvider()
+    runner = FakeRunner()
+    run_dir = tmp_path / "run"
+    transcript_path = run_dir / "local_evidence" / "youtube_01" / "video.txt"
+    transcript_path.parent.mkdir(parents=True)
+    transcript_path.write_text("Lokaler Beleg ohne SearXNG.", encoding="utf-8")
+    local_evidence = LocalEvidenceReport(
+        items=[
+            LocalEvidenceItem(
+                id="E1",
+                url="https://www.youtube.com/watch?v=abc123",
+                title="Lokaler Beleg",
+                transcript_path="local_evidence/youtube_01/video.txt",
+                transcript_chars=27,
+                transcript_excerpt="Lokaler Beleg ohne SearXNG.",
+            )
+        ]
+    )
+
+    result = DeepResearchEngine(config, runner, tmp_path, provider=provider).run(
+        topic="T",
+        language="de-DE",
+        run_dir=run_dir,
+        local_evidence=local_evidence,
+    )
+
+    assert [call["schema_name"] for call in runner.calls] == ["evidence_batch", "research_dossier"]
+    assert result.documents[0].query == "youtube_transcript:E1"
+    assert "local_search_unavailable" in result.warnings
+    assert "local_web_search_skipped" in result.warnings
+    plan = DeepResearchPlan.model_validate_json((run_dir / "research_plan.json").read_text(encoding="utf-8"))
+    assert plan.seed_queries == []
+
+
+def test_deep_research_reports_provider_error_when_search_unavailable_without_documents(tmp_path: Path):
+    class UnavailableProvider(FakeProvider):
+        def check_available(self):
+            raise ResearchProviderError("offline", code="local_search_unavailable")
+
+        def search(self, query: str, *, max_results: int, depth: str):
+            raise AssertionError("search should be skipped when provider is unavailable")
+
+    config = load_config(tmp_path / "missing.yml")
+    config.research.depth = "deep"
+    config.research.max_minutes = 1
+    config.research.max_rounds = 1
+    runner = FakeRunner()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    try:
+        DeepResearchEngine(config, runner, tmp_path, provider=UnavailableProvider()).run(
+            topic="T",
+            language="de-DE",
+            run_dir=run_dir,
+        )
+    except ResearchProviderError as exc:
+        assert exc.code == "local_search_unavailable"
+    else:
+        raise AssertionError("expected provider error for pipeline fallback")
+    assert runner.calls == []
 
 
 def test_deep_research_adds_search_discovered_youtube_transcripts(monkeypatch, tmp_path: Path):

@@ -1,8 +1,9 @@
 import re
 
+import codcast.pipeline as pipeline
 from codcast.config import load_config
-from codcast.models import RunManifest
-from codcast.models import PodcastScript, ScriptLine
+from codcast.deep_research import ResearchProviderError
+from codcast.models import PodcastScript, ResearchReport, RunManifest, ScriptLine, ValidationReport
 from codcast.pipeline import PodcastGenerator
 from codcast.voices import build_speaker_specs, select_voice_profiles
 
@@ -76,6 +77,64 @@ def test_normalize_script_splits_long_tts_lines(tmp_path):
     assert all(len(line.text) <= 220 for line in normalized.lines)
     assert all(line.speaker_id == "s1" for line in normalized.lines)
     assert all(line.claim_ids == ["C1"] for line in normalized.lines)
+
+
+def test_generate_falls_back_to_standard_research_when_deep_provider_is_unavailable(monkeypatch, tmp_path):
+    class UnavailableDeepResearch:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            raise ResearchProviderError("offline", code="local_search_unavailable")
+
+    class FallbackRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run_structured(self, *, schema_name, output_path, model, **kwargs):
+            self.calls.append({"schema_name": schema_name, "output_path": output_path, "kwargs": kwargs})
+            if model is ResearchReport:
+                result = ResearchReport(topic="Thema", language="de-DE", summary="Standard fallback")
+            elif model is ValidationReport:
+                result = ValidationReport(topic="Thema", pass_status="pass")
+            elif model is PodcastScript:
+                result = PodcastScript(
+                    title="Titel",
+                    topic="Thema",
+                    target_min_minutes=0.01,
+                    target_max_minutes=1.0,
+                    speakers=[],
+                    lines=[ScriptLine(speaker_id="s1", text="Hallo Welt.")],
+                )
+            else:
+                raise AssertionError(model)
+            output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            return result
+
+    monkeypatch.setattr(pipeline, "DeepResearchEngine", UnavailableDeepResearch)
+    config = load_config(tmp_path / "missing.yml")
+    config.research.depth = "dossier"
+    config.evidence.enabled = False
+    generator = PodcastGenerator(config, tmp_path)
+    runner = FallbackRunner()
+    generator.runner = runner
+
+    manifest = generator.generate(
+        topic="Thema",
+        min_minutes=0.01,
+        max_minutes=1.0,
+        speaker_count=1,
+        quality="openai",
+        language="de-DE",
+        research_depth="dossier",
+        render_audio=False,
+    )
+
+    assert manifest.research_depth == "standard"
+    assert "local_search_unavailable" in manifest.warnings
+    assert "deep_research_fallback_standard" in manifest.warnings
+    assert [call["schema_name"] for call in runner.calls] == ["research", "validation", "script"]
+    assert "live_search" not in runner.calls[0]["kwargs"]
 
 
 def test_resume_rejects_manifest_run_id_path_traversal(tmp_path):
