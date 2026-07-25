@@ -251,6 +251,15 @@ class TTSConfig(ConfigModel):
     # sobald mehrere Stimmpaare fuer dasselbe Backend konfiguriert sind.
     voice_set: str | None = None
     voice_sets: dict[str, list[str]] = Field(default_factory=dict)
+    # Bereits gerenderte Segmente wiederverwenden, wenn Text und Stimme
+    # unveraendert sind. Ohne das kostet ein Abbruch bei Segment 150 von 184
+    # alle 149 fertigen Segmente. `rerender` schaltet es ab, denn dort ist ein
+    # neuer Take die Absicht.
+    reuse_segments: bool = True
+    # Auf einer geteilten GPU ist ein Speicherfehler meist voruebergehend:
+    # ein Spiel oder ein anderes Modell gibt kurz darauf wieder Platz frei.
+    gpu_oom_retries: int = 2
+    gpu_oom_wait_sec: int = 20
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     chatterbox: ChatterboxConfig = Field(default_factory=ChatterboxConfig)
     kokoro: KokoroConfig = Field(default_factory=KokoroConfig)

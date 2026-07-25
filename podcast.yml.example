@@ -115,6 +115,13 @@ tts:
   backend: chatterbox
   language: de
   allow_voice_reuse: false
+  # Bricht ein langer Lauf am GPU-Speicher ab, kosten diese beiden Zeilen die
+  # Arbeit nicht: fertige Segmente werden anhand eines Fingerabdrucks aus Text,
+  # Stimme und Backend-Einstellungen wiedererkannt, Speicherfehler wiederholt.
+  # `rerender` ignoriert reuse_segments, dort ist ein neuer Take gewollt.
+  reuse_segments: true
+  gpu_oom_retries: 2
+  gpu_oom_wait_sec: 20
   chatterbox:
     # Eigene venv, angelegt von `codcast setup-chatterbox`.
     python_executable: .venv-chatterbox/bin/python

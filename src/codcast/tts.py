@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -442,11 +443,19 @@ class ScriptRenderer:
         self.config = config
         self.voices = voices
         self.backends: dict[str, TTSBackend] = {}
+        # Wird nur waehrend render_script gesetzt, damit auch die Meldungen aus
+        # der Wiederholschleife in der TUI landen und nicht nur auf stderr.
+        self._progress: ProgressReporter | None = None
 
     def _backend(self, voice: VoiceProfile) -> TTSBackend:
         if voice.backend not in self.backends:
             self.backends[voice.backend] = backend_for_voice(self.config, voice)
         return self.backends[voice.backend]
+
+    def _drop_backend(self, voice: VoiceProfile) -> None:
+        backend = self.backends.pop(voice.backend, None)
+        if backend is not None:
+            close_backend(backend)
 
     def _voice_for_line(self, script: PodcastScript, line: ScriptLine) -> VoiceProfile:
         return self._voice_for_speaker_id(script, line.speaker_id)
@@ -498,6 +507,7 @@ class ScriptRenderer:
                 )
             )
 
+        self._progress = progress
         try:
             if self._should_render_openai_chunks_parallel(prepared):
                 return self._render_prepared_chunks_parallel(prepared, total, progress, cancellation)
@@ -505,6 +515,7 @@ class ScriptRenderer:
         finally:
             # Lokale Modelle geben ihren VRAM frei, bevor Assembly und Export laufen.
             self.close()
+            self._progress = None
 
     def close(self) -> None:
         for backend in self.backends.values():
@@ -574,7 +585,94 @@ class ScriptRenderer:
         return [rendered_by_index[index] for index in sorted(rendered_by_index)]
 
     def _render_prepared_chunk(self, item: PreparedRenderChunk) -> None:
-        self._backend(item.voice).render(item.chunk.text, item.voice, item.wav_path)
+        if self._reuse_finished_segment(item):
+            return
+        self._render_chunk_with_oom_retry(item)
+
+    def _fingerprint_path(self, item: PreparedRenderChunk) -> Path:
+        return item.wav_path.with_name(f"{item.wav_path.stem}.fingerprint.json")
+
+    def _segment_fingerprint(self, item: PreparedRenderChunk) -> dict[str, object]:
+        """Alles, was den Klang dieses Segments bestimmt.
+
+        Bewusst grosszuegig gefasst: ein Feld zu viel laesst unnoetig neu
+        rendern, ein Feld zu wenig liefert altes Audio zu neuem Text. Nur der
+        zweite Fehler ist teuer, weil er unbemerkt bleibt.
+        """
+        backend_config = getattr(self.config.tts, item.voice.backend, None)
+        return {
+            "text": item.chunk.text,
+            "voice": item.voice.model_dump(mode="json"),
+            "backend_config": (
+                backend_config.model_dump(mode="json") if backend_config is not None else None
+            ),
+        }
+
+    def _reuse_finished_segment(self, item: PreparedRenderChunk) -> bool:
+        if not self.config.tts.reuse_segments:
+            return False
+        fingerprint_path = self._fingerprint_path(item)
+        if not item.wav_path.exists() or not fingerprint_path.exists():
+            return False
+        try:
+            stored = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if stored != self._segment_fingerprint(item):
+            return False
+        report_progress(
+            self._progress,
+            ProgressEvent("progress", "tts", f"Segment {item.index} unveraendert, uebernommen"),
+        )
+        return True
+
+    def _render_chunk_with_oom_retry(self, item: PreparedRenderChunk) -> None:
+        attempts = max(0, self.config.tts.gpu_oom_retries) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._render_chunk_atomically(item)
+                return
+            except Exception as error:
+                if attempt == attempts or not _is_out_of_memory(error):
+                    raise
+                wait = max(0, self.config.tts.gpu_oom_wait_sec)
+                message = (
+                    f"Segment {item.index}: GPU-Speicher voll (Versuch {attempt} von {attempts}). "
+                    f"Modell wird entladen, neuer Versuch in {wait} s."
+                )
+                report_progress(
+                    self._progress, ProgressEvent("log", "tts", message, level="warning")
+                )
+                print(f"[tts] {message}", file=sys.stderr)
+                # Der gescheiterte Worker haelt seinen VRAM weiter fest. Ohne das
+                # Entladen braeuchte der naechste Versuch genauso viel Speicher
+                # und scheiterte genauso.
+                self._drop_backend(item.voice)
+                if wait:
+                    time.sleep(wait)
+
+    def _render_chunk_atomically(self, item: PreparedRenderChunk) -> None:
+        """Erst vollstaendig schreiben, dann umbenennen.
+
+        Damit heisst "Datei existiert" auch wirklich "Segment ist fertig". Ohne
+        das koennte ein abgebrochener Lauf eine halbe WAV hinterlassen, die beim
+        naechsten Mal als fertig durchgeht. Die Endung bleibt `.wav`, weil
+        torchaudio das Format aus ihr ableitet.
+        """
+        pending = item.wav_path.with_name(f"{item.wav_path.stem}.part.wav")
+        fingerprint_path = self._fingerprint_path(item)
+        fingerprint_path.unlink(missing_ok=True)
+        self._backend(item.voice).render(item.chunk.text, item.voice, pending)
+        fingerprint_path.write_text(
+            json.dumps(self._segment_fingerprint(item), ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(pending, item.wav_path)
+
+
+def _is_out_of_memory(error: BaseException) -> bool:
+    text = str(error).lower()
+    return "out of memory" in text or "outofmemoryerror" in text
 
 
 def rendered_segment_for_chunk(item: PreparedRenderChunk) -> RenderedSegment:

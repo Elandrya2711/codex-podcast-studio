@@ -121,6 +121,15 @@ Chatterbox spricht gelegentlich einen Satz zweimal oder bricht mitten drin ab. B
 
 Der Worker setzt `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, damit die Synthese nicht an Fragmentierung scheitert, wenn parallel ein Spiel oder ein Ollama-Modell auf der GPU liegt. Bleiben weniger als etwa 5 GB frei, reicht es trotzdem nicht: dann entweder ein Modell entladen (`ollama stop <modell>`) oder `tts.chatterbox.device: cpu` setzen. CPU funktioniert, ist aber deutlich langsamer.
 
+### Ein Abbruch kostet keine fertigen Segmente
+
+Eine 20-Minuten-Folge sind rund 180 Segmente und knapp zehn Minuten GPU-Zeit. Auf einer geteilten Karte kann das mitten im Lauf am Speicher scheitern, etwa weil ein Modell nachgeladen wird. Zwei Vorkehrungen dagegen:
+
+- **Speicherfehler werden wiederholt** (`tts.gpu_oom_retries`, Standard 2). Vor jedem neuen Versuch wird das Modell entladen, denn der gescheiterte Worker haelt seinen VRAM sonst weiter fest, und danach `tts.gpu_oom_wait_sec` Sekunden gewartet (Standard 20). Ein Engpass durch ein anderes Programm loest sich in dieser Zeit oft von selbst.
+- **Fertige Segmente werden uebernommen** (`tts.reuse_segments`, Standard an). Neben jedem Segment liegt ein Fingerabdruck aus Text, Stimmprofil und Backend-Einstellungen. Nur wenn der exakt passt, wird das vorhandene Audio verwendet. Geschrieben wird zuerst unter einem Zwischennamen und erst am Ende umbenannt, damit "Datei existiert" auch wirklich "Segment ist fertig" heisst.
+
+`rerender` schaltet die Wiederverwendung bewusst ab, denn dort ist ein neuer Take die Absicht. Wer einen abgebrochenen `rerender` fortsetzen will, gibt `--reuse-segments` mit.
+
 Fish bleibt als optionaler Premium-/Experimentierpfad mit kuratierten Referenzstimmen:
 
 - `Jonas`: maennlicher Fish-Host, erwartet `voices/fish/host-m.wav`

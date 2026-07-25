@@ -810,6 +810,10 @@ def cmd_rerender(args: argparse.Namespace) -> int:
     config.tts.quality = selected_quality
     config.tts.backend = backend_for_quality(config, selected_quality)
     _apply_voice_set(config, args)
+    # Wer rerender aufruft, will neues Audio, etwa einen neuen Take fuer ein
+    # missgluecktes Segment. Wiederverwendung nur auf ausdruecklichen Wunsch,
+    # sonst waere der Befehl bei gleicher Eingabe wirkungslos.
+    config.tts.reuse_segments = bool(getattr(args, "reuse_segments", False))
 
     run_dir = resolve_run_dir(args.run, config)
     script_path = run_dir / "script.json"
@@ -1098,6 +1102,12 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     rerender.add_argument("--quality", choices=list(QUALITY_CHOICES), default=None)
     rerender.add_argument("--voice-set", default=None, help="Named voice set from podcast.yml (tts.voice_sets)")
     rerender.add_argument("--suffix", default="openai-tts")
+    rerender.add_argument(
+        "--reuse-segments",
+        action="store_true",
+        help="Fertige Segmente mit unveraendertem Text und gleicher Stimme uebernehmen. "
+        "Standard ist neu rendern, denn genau das ist bei rerender die Absicht.",
+    )
     rerender.set_defaults(func=cmd_rerender)
 
     inspect = sub.add_parser("inspect", help="Print a run manifest")
