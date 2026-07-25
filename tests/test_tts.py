@@ -182,8 +182,14 @@ def test_openai_single_speaker_lines_are_grouped_without_labels(tmp_path):
 
     rendered = renderer.render_script(script, tmp_path)
 
+    expected = ["Alpha beta.\n\nGamma delta.", "Epsilon zeta."]
+
     assert len(rendered) == 2
-    assert fake.calls == ["Alpha beta.\n\nGamma delta.", "Epsilon zeta."]
+    # Die Gruppierung sitzt in der Reihenfolge der Ergebnisse. Die Aufrufe
+    # laufen bei openai.concurrency = 4 nebeneinander und kommen in beliebiger
+    # Reihenfolge an.
+    assert [item.text for item in rendered] == expected
+    assert sorted(fake.calls) == sorted(expected)
     assert all("s1:" not in item for item in fake.calls)
 
 
@@ -220,12 +226,19 @@ def test_openai_multi_speaker_stays_line_by_line(tmp_path):
 
     rendered = renderer.render_script(script, tmp_path)
 
-    assert len(rendered) == 3
-    assert fake.calls == [
+    expected = [
         ("openai-cedar", "Erste Zeile."),
         ("openai-marin", "Zweite Zeile."),
         ("openai-cedar", "Dritte Zeile."),
     ]
+
+    assert len(rendered) == 3
+    # Zugesichert ist die Reihenfolge der Ergebnisse. Die der Aufrufe ist es
+    # nicht: bei openai.concurrency = 4 laufen diese Segmente in vier Threads.
+    assert [(item.voice_profile_id, item.text) for item in rendered] == expected
+    # Der Kern dieses Tests: drei getrennte Aufrufe mit je der richtigen Stimme,
+    # nicht ein zusammengefasster wie im Ein-Sprecher-Fall darueber.
+    assert sorted(fake.calls) == sorted(expected)
 
 
 def test_openai_segments_render_in_parallel_and_keep_order(tmp_path):
