@@ -471,7 +471,7 @@ class PodcastGenerator:
                 model=PodcastScript,
                 progress=progress,
                 cancellation=cancellation,
-                live_search=False if local_research_only else None,
+                live_search=False,
             )
             script = self._normalize_script(script, speakers, min_minutes, max_minutes, language)
             report_progress(progress, ProgressEvent("done", "script", f"Skript mit {len(script.lines)} TTS-Zeilen erstellt"))
@@ -480,7 +480,7 @@ class PodcastGenerator:
                 run_dir,
                 progress=progress,
                 cancellation=cancellation,
-                live_search=False if local_research_only else None,
+                live_search=False,
             )
         report_progress(progress, ProgressEvent("start", "artifacts", "Transkript und Quellen schreiben"))
         script_artifacts = self._write_script_artifacts(script, research, validation, run_dir, run_id)

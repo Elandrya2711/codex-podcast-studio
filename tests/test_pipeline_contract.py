@@ -98,13 +98,14 @@ def test_generate_falls_back_to_standard_research_when_deep_provider_is_unavaila
             elif model is ValidationReport:
                 result = ValidationReport(topic="Thema", pass_status="pass")
             elif model is PodcastScript:
+                text = "Kurz." if output_path.name == "script.json" else " ".join(["Wort"] * 180)
                 result = PodcastScript(
                     title="Titel",
                     topic="Thema",
-                    target_min_minutes=0.01,
-                    target_max_minutes=1.0,
+                    target_min_minutes=1.0,
+                    target_max_minutes=2.0,
                     speakers=[],
-                    lines=[ScriptLine(speaker_id="s1", text="Hallo Welt.")],
+                    lines=[ScriptLine(speaker_id="s1", text=text)],
                 )
             else:
                 raise AssertionError(model)
@@ -121,8 +122,8 @@ def test_generate_falls_back_to_standard_research_when_deep_provider_is_unavaila
 
     manifest = generator.generate(
         topic="Thema",
-        min_minutes=0.01,
-        max_minutes=1.0,
+        min_minutes=1.0,
+        max_minutes=2.0,
         speaker_count=1,
         quality="openai",
         language="de-DE",
@@ -133,8 +134,10 @@ def test_generate_falls_back_to_standard_research_when_deep_provider_is_unavaila
     assert manifest.research_depth == "standard"
     assert "local_search_unavailable" in manifest.warnings
     assert "deep_research_fallback_standard" in manifest.warnings
-    assert [call["schema_name"] for call in runner.calls] == ["research", "validation", "script"]
+    assert [call["schema_name"] for call in runner.calls] == ["research", "validation", "script", "script"]
     assert "live_search" not in runner.calls[0]["kwargs"]
+    assert runner.calls[2]["kwargs"]["live_search"] is False
+    assert runner.calls[3]["kwargs"]["live_search"] is False
 
 
 def test_resume_rejects_manifest_run_id_path_traversal(tmp_path):
