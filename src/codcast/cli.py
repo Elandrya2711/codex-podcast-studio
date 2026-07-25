@@ -827,7 +827,9 @@ def cmd_rerender(args: argparse.Namespace) -> int:
         for speaker, profile in zip(script.speakers, profiles, strict=True)
     ]
 
-    suffix = args.suffix.strip().strip("-")
+    # Ohne Angabe benennt sich die Datei nach dem Backend, das sie erzeugt hat.
+    # Der fruehere Festwert "openai-tts" stand auch auf lokal gerenderten Folgen.
+    suffix = (args.suffix or config.tts.backend).strip().strip("-")
     if not suffix:
         raise SystemExit("Suffix cannot be empty")
     output_stem = f"{run_dir.name}-{suffix}"
@@ -1101,7 +1103,11 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     rerender.add_argument("run", type=Path)
     rerender.add_argument("--quality", choices=list(QUALITY_CHOICES), default=None)
     rerender.add_argument("--voice-set", default=None, help="Named voice set from podcast.yml (tts.voice_sets)")
-    rerender.add_argument("--suffix", default="openai-tts")
+    rerender.add_argument(
+        "--suffix",
+        default=None,
+        help="Namenszusatz fuer Ausgabe und Segmentliste. Standard ist das aktive Backend.",
+    )
     rerender.add_argument(
         "--reuse-segments",
         action="store_true",

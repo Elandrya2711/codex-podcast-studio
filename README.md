@@ -229,7 +229,7 @@ Ohne neue Recherche oder Skript-Erzeugung kann ein vorhandener Run erneut verton
 uv run codcast rerender podcasts/<run-ordner> --quality openai --suffix openai-tts
 ```
 
-Das liest nur `script.json` und schreibt neue Dateien mit Suffix, z. B. `segments-openai-tts.json` und `<run-id>-openai-tts.mp3`.
+Das liest nur `script.json` und schreibt neue Dateien mit Suffix, z. B. `segments-openai-tts.json` und `<run-id>-openai-tts.mp3`. Ohne `--suffix` benennt sich die Ausgabe nach dem aktiven Backend, also `<run-id>-chatterbox.mp3` bei einem lokalen Lauf.
 
 Bei OpenAI werden Einsprecher-Skripte automatisch zu groesseren Requests unter `tts.openai.max_input_chars` gebuendelt. OpenAI-Requests laufen bis `tts.openai.concurrency` parallel. Mehrsprecher-Skripte bleiben zeilenweise, damit kein teurer Zusatzkontext pro Sprecherwechsel noetig ist.
 

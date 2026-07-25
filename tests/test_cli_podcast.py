@@ -1,4 +1,7 @@
 import tomllib
+from pathlib import Path
+
+import pytest
 
 import codcast.cli as cli
 from codcast.models import PodcastScript, RenderedSegment, RunManifest, ScriptLine, SpeakerSpec
@@ -434,3 +437,70 @@ def test_podcast_wizard_can_switch_to_local_chatterbox(monkeypatch, tmp_path):
     assert result == 0
     assert FakeTui.calls[0]["generator"].config.tts.quality == "chatterbox"
     assert FakeTui.calls[0]["generator"].config.tts.backend == "chatterbox"
+
+
+def _rerender_run_dir(tmp_path) -> Path:
+    run_dir = tmp_path / "podcasts" / "test-run"
+    run_dir.mkdir(parents=True)
+    (tmp_path / "podcast.yml").write_text("output_root: podcasts\n", encoding="utf-8")
+    script = PodcastScript(
+        title="Titel",
+        topic="Thema",
+        target_min_minutes=1,
+        target_max_minutes=2,
+        speakers=[SpeakerSpec(id="s1", display_name="Old", role="Host", voice_profile_id="alt")],
+        lines=[ScriptLine(speaker_id="s1", text="Hallo Welt.")],
+    )
+    (run_dir / "script.json").write_text(script.model_dump_json(), encoding="utf-8")
+    return run_dir
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_stem", "expected_reuse"),
+    [
+        ([], "test-run-chatterbox", False),
+        (["--suffix", "zweiter-take"], "test-run-zweiter-take", False),
+        (["--reuse-segments"], "test-run-chatterbox", True),
+    ],
+    ids=["standard-nennt-das-backend", "eigener-suffix", "fortsetzen-erlaubt"],
+)
+def test_rerender_names_output_after_the_backend_and_defaults_to_fresh_takes(
+    monkeypatch, tmp_path, extra_args, expected_stem, expected_reuse
+):
+    run_dir = _rerender_run_dir(tmp_path)
+    calls = {}
+
+    class FakeRenderer:
+        def __init__(self, config, voices):
+            calls["reuse_segments"] = config.tts.reuse_segments
+
+        def render_script(self, script, run_dir_arg, progress=None):
+            return [
+                RenderedSegment(
+                    index=1,
+                    speaker_id="s1",
+                    voice_profile_id=script.speakers[0].voice_profile_id,
+                    text="Hallo Welt.",
+                    wav_path=str(run_dir_arg / "segments" / "0001.wav"),
+                )
+            ]
+
+    def fake_assemble_episode(
+        rendered, run_dir_arg, audio_config, pause_between_lines_sec, output_stem, progress=None
+    ):
+        calls["output_stem"] = output_stem
+        return run_dir_arg / f"{output_stem}.wav", run_dir_arg / f"{output_stem}.mp3", 1.23
+
+    monkeypatch.setattr(cli, "project_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "ScriptRenderer", FakeRenderer)
+    monkeypatch.setattr(cli, "assemble_episode", fake_assemble_episode)
+    args = cli.build_parser().parse_args(
+        ["rerender", "test-run", "--config", str(tmp_path / "podcast.yml"), "--quality", "chatterbox"]
+        + extra_args
+    )
+
+    assert cli.cmd_rerender(args) == 0
+    assert calls["output_stem"] == expected_stem
+    # Ein rerender soll neu sprechen, sonst ist der Befehl bei gleicher Eingabe wirkungslos.
+    assert calls["reuse_segments"] is expected_reuse
+    assert (run_dir / f"segments-{expected_stem.removeprefix('test-run-')}.json").exists()
