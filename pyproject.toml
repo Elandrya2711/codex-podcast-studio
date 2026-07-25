@@ -1,6 +1,6 @@
 [project]
 name = "codex-podcast-studio"
-version = "1.0.0"
+version = "1.1.0"
 description = "Generate researched German podcasts with Codex CLI and local TTS."
 readme = "README.md"
 license = { file = "LICENSE" }
