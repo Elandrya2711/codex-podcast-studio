@@ -1,9 +1,10 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from codcast.claude_runner import ClaudeRunner
+from codcast.claude_runner import ClaudeRunner, _describe_rate_limit
 from codcast.config import ClaudeConfig
 from codcast.models import ResearchReport
 from codcast.schemas import schema_for
@@ -115,7 +116,14 @@ def test_claude_runner_parses_structured_output_and_streams_logs(tmp_path: Path)
             {"type": "system", "subtype": "init", "tools": ["StructuredOutput"], "mcp_servers": []},
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "arbeite"}]}},
             {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "WebSearch"}]}},
-            {"type": "rate_limit_event"},
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": 1785015000,
+                },
+            },
             {
                 "type": "result",
                 "is_error": False,
@@ -147,7 +155,10 @@ def test_claude_runner_parses_structured_output_and_streams_logs(tmp_path: Path)
     assert any("tool: WebSearch" in message for message in messages)
     assert any("0 MCP-Server" in message for message in messages)
     assert any("stderr-line" in message for message in messages)
-    assert any(event.level == "warning" for event in events)
+    # Ein Kontingent-Event mit status "allowed" kommt bei jedem Aufruf und ist
+    # keine Warnung. Sonst steht in jedem Lauf eine, die nichts bedeutet.
+    assert not any(event.level == "warning" for event in events)
+    assert not any("Kontingent" in message for message in messages)
 
 
 def test_claude_runner_falls_back_to_text_result(tmp_path: Path):
@@ -221,3 +232,59 @@ def test_claude_runner_raises_on_nonzero_exit(tmp_path: Path):
             output_path=tmp_path / "research.json",
             model=ResearchReport,
         )
+
+
+def test_rate_limit_event_stays_quiet_while_allowed():
+    event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "allowed",
+            "rateLimitType": "five_hour",
+            "resetsAt": 1785015000,
+            "overageStatus": "rejected",
+        },
+    }
+
+    # "overageStatus": "rejected" heisst nur, dass kein Bezahl-Ueberlauf
+    # erlaubt ist. Das ist der gewollte Zustand und kein Engpass.
+    assert _describe_rate_limit(event) == []
+
+
+def test_rate_limit_event_warns_with_window_and_reset_time():
+    resets_at = 1785015000
+    event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "rateLimitType": "five_hour",
+            "resetsAt": resets_at,
+        },
+    }
+
+    lines = _describe_rate_limit(event)
+
+    assert len(lines) == 1
+    message, level = lines[0]
+    assert level == "warning"
+    assert "rejected" in message
+    assert "five_hour" in message
+    assert datetime.fromtimestamp(resets_at).strftime("%H:%M") in message
+
+
+@pytest.mark.parametrize(
+    "info",
+    [None, {}, {"status": "blocked"}],
+    ids=["fehlt", "leer", "nur-status"],
+)
+def test_rate_limit_event_survives_thin_payloads(info):
+    event = {"type": "rate_limit_event"}
+    if info is not None:
+        event["rate_limit_info"] = info
+
+    lines = _describe_rate_limit(event)
+
+    if info == {"status": "blocked"}:
+        assert lines == [("Kontingent der Claude CLI: blocked", "warning")]
+    else:
+        # Ohne verwertbare Angaben lieber schweigen als raten.
+        assert lines == []

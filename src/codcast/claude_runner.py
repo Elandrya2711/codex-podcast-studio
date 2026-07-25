@@ -4,6 +4,7 @@ import json
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -234,11 +235,37 @@ class ClaudeRunner:
             return
 
 
+def _describe_rate_limit(event: dict[str, Any]) -> list[tuple[str, str]]:
+    """Nur melden, wenn das Kontingent wirklich klemmt.
+
+    Die CLI schickt dieses Event bei jedem Aufruf mit, im Regelfall mit
+    `status: "allowed"`. Das als Warnung zu fuehren, macht jede Warnung im Log
+    wertlos. Der Rohtext steht ohnehin in `<stufe>.stdout.log`, falls jemand
+    das Fenster nachrechnen will.
+    """
+    info = event.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return []
+    status = info.get("status")
+    if not isinstance(status, str) or status == "allowed":
+        # Kein lesbarer Status ist kein Engpass, sondern nur eine Aussage, die
+        # wir nicht deuten koennen. Raten wuerde hier falschen Alarm erzeugen.
+        return []
+    parts = [f"Kontingent der Claude CLI: {status}"]
+    window = info.get("rateLimitType")
+    if window:
+        parts.append(f"Fenster {window}")
+    resets_at = info.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+        parts.append(f"frei ab {datetime.fromtimestamp(resets_at):%H:%M}")
+    return [(", ".join(parts), "warning")]
+
+
 def _describe_event(event: dict[str, Any]) -> list[tuple[str, str]]:
     """Turn one stream-json event into zero or more human-readable log lines."""
     event_type = event.get("type")
     if event_type == "rate_limit_event":
-        return [("Rate-Limit-Hinweis von der Claude CLI", "warning")]
+        return _describe_rate_limit(event)
     if event_type == "system":
         if event.get("subtype") == "init":
             servers = event.get("mcp_servers") or []
