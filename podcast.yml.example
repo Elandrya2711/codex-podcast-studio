@@ -120,8 +120,12 @@ tts:
   # Stimme und Backend-Einstellungen wiedererkannt, Speicherfehler wiederholt.
   # `rerender` ignoriert reuse_segments, dort ist ein neuer Take gewollt.
   reuse_segments: true
-  gpu_oom_retries: 2
-  gpu_oom_wait_sec: 20
+  gpu_oom_retries: 4
+  gpu_oom_wait_sec: 30
+  # Auf true setzen, wenn Ollama nebenbei laeuft: dann entlaedt der Renderer bei
+  # Speichermangel selbst, statt nur zu warten. Standard aus, weil das in einen
+  # fremden Dienst greift.
+  gpu_oom_free_ollama: false
   chatterbox:
     # Eigene venv, angelegt von `codcast setup-chatterbox`.
     python_executable: .venv-chatterbox/bin/python

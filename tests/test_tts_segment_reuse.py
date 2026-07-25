@@ -18,6 +18,19 @@ OOM_MESSAGE = (
     "Tried to allocate 20.00 MiB."
 )
 
+# Vor dem Stummschalten festhalten: die Tests der Auskunft selbst brauchen das Echte.
+REAL_GPU_HINT = tts.gpu_memory_hint
+
+
+@pytest.fixture(autouse=True)
+def no_real_gpu_queries(monkeypatch):
+    """Kein Test befragt die echte Grafikkarte.
+
+    Sonst haengt das Ergebnis daran, was auf dem Rechner gerade laeuft, und
+    jeder Wiederholversuch startet einen nvidia-smi-Prozess.
+    """
+    monkeypatch.setattr(tts, "gpu_memory_hint", lambda: None)
+
 
 class _CountingBackend(tts.TTSBackend):
     """Protokolliert jeden Renderaufruf und kann Fehler nach Plan werfen."""
@@ -194,11 +207,12 @@ def test_out_of_memory_gives_up_after_the_configured_retries(backend, no_waiting
     config = AppConfig()
     config.tts.gpu_oom_retries = 2
 
-    with pytest.raises(RuntimeError, match="out of memory"):
+    with pytest.raises(RuntimeError, match="keinen GPU-Speicher bekommen") as failure:
         _render(config, _script("Erste Zeile."), tmp_path, _voice())
 
     assert len(backend.render_calls()) == 3, "ein Versuch plus zwei Wiederholungen"
     assert len(no_waiting) == 2
+    assert "out of memory" in str(failure.value.__cause__).lower()
 
 
 def test_other_failures_are_not_retried(backend, no_waiting, tmp_path: Path):
@@ -252,3 +266,102 @@ def test_audio_written_before_a_failure_is_not_mistaken_for_finished(
     monkeypatch.setattr(_CountingBackend, "render", healthy_render)
     _render(AppConfig(), script, tmp_path, _voice())
     assert (segment_dir / "0001_s1_v.wav").read_bytes() == b"RIFF"
+
+
+def test_gpu_hint_names_the_biggest_holders(monkeypatch):
+    def fake_run(command, **kwargs):
+        if "--query-gpu=memory.free" in command:
+            return type("R", (), {"returncode": 0, "stdout": "2988\n"})()
+        return type("R", (), {"returncode": 0, "stdout": "143208, 2154\n547370, 4162\n"})()
+
+    monkeypatch.setattr(tts.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        tts.Path, "read_text", lambda self, encoding=None: {"143208": "python", "547370": "llama-server"}[self.parts[2]]
+    )
+
+    hint = REAL_GPU_HINT()
+
+    assert hint is not None
+    assert "2988 MiB" in hint
+    # Der groesste Halter zuerst, denn den entlaedt man als erstes.
+    assert hint.index("llama-server") < hint.index("python")
+
+
+def test_gpu_hint_is_absent_without_nvidia_smi(monkeypatch):
+    def missing(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(tts.subprocess, "run", missing)
+
+    assert REAL_GPU_HINT() is None
+
+
+def test_ollama_models_are_unloaded_by_name(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ollama", "ps"]:
+            stdout = (
+                "NAME         ID              SIZE      PROCESSOR    UNTIL\n"
+                "gemma3:4b    a2af6cc3eb7f    3.0 GB    100% GPU     28 minutes from now\n"
+                "qwen3:8b     b1cf7dd4fa8e    5.2 GB    100% GPU     4 minutes from now\n"
+            )
+            return type("R", (), {"returncode": 0, "stdout": stdout})()
+        return type("R", (), {"returncode": 0, "stdout": ""})()
+
+    monkeypatch.setattr(tts.subprocess, "run", fake_run)
+
+    assert tts.free_ollama_models() == ["gemma3:4b", "qwen3:8b"]
+    assert ["ollama", "stop", "gemma3:4b"] in calls
+    assert ["ollama", "stop", "qwen3:8b"] in calls
+
+
+def test_no_loaded_model_means_nothing_to_unload(monkeypatch):
+    header_only = "NAME    ID    SIZE    PROCESSOR    UNTIL\n"
+    monkeypatch.setattr(
+        tts.subprocess,
+        "run",
+        lambda command, **kwargs: type("R", (), {"returncode": 0, "stdout": header_only})(),
+    )
+
+    assert tts.free_ollama_models() == []
+
+
+def test_out_of_memory_unloads_ollama_when_allowed(backend, no_waiting, monkeypatch, tmp_path: Path):
+    freed = []
+    monkeypatch.setattr(tts, "free_ollama_models", lambda: freed.append("call") or ["gemma3:4b"])
+    backend.failures = [RuntimeError(OOM_MESSAGE)]
+    config = AppConfig()
+    config.tts.gpu_oom_free_ollama = True
+
+    _render(config, _script("Erste Zeile."), tmp_path, _voice())
+
+    assert freed == ["call"], "genau einmal entladen, nicht pro Segment"
+
+
+def test_ollama_is_left_alone_by_default(backend, no_waiting, monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(tts, "free_ollama_models", lambda: pytest.fail("fremder Dienst ungefragt angefasst"))
+    backend.failures = [RuntimeError(OOM_MESSAGE)]
+
+    assert AppConfig().tts.gpu_oom_free_ollama is False
+    _render(AppConfig(), _script("Erste Zeile."), tmp_path, _voice())
+
+
+def test_the_final_error_says_what_to_do(backend, no_waiting, monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(tts, "gpu_memory_hint", lambda: "frei sind 28 MiB; groesste Belegung: llama-server 4162 MiB")
+    backend.failures = [RuntimeError(OOM_MESSAGE)] * 9
+    config = AppConfig()
+    config.tts.gpu_oom_retries = 1
+
+    with pytest.raises(RuntimeError) as failure:
+        _render(config, _script("Erste Zeile."), tmp_path, _voice())
+
+    message = str(failure.value)
+    assert "llama-server 4162 MiB" in message, "wer den Speicher haelt"
+    assert "ollama stop" in message, "was zu tun ist"
+    assert "device: cpu" in message, "der unabhaengige Ausweg"
+    assert f"codcast rerender {tmp_path} --reuse-segments" in message, "wie es weitergeht"
+    # Die eigentliche Ursache darf nicht verloren gehen.
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert "out of memory" in str(failure.value.__cause__).lower()

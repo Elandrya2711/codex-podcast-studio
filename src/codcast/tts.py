@@ -633,12 +633,22 @@ class ScriptRenderer:
                 self._render_chunk_atomically(item)
                 return
             except Exception as error:
-                if attempt == attempts or not _is_out_of_memory(error):
+                if not _is_out_of_memory(error):
                     raise
+                if attempt == attempts:
+                    raise RuntimeError(self._out_of_memory_advice(item, attempts)) from error
                 wait = max(0, self.config.tts.gpu_oom_wait_sec)
+                hint = gpu_memory_hint()
+                freed = free_ollama_models() if self.config.tts.gpu_oom_free_ollama else []
                 message = (
-                    f"Segment {item.index}: GPU-Speicher voll (Versuch {attempt} von {attempts}). "
-                    f"Modell wird entladen, neuer Versuch in {wait} s."
+                    f"Segment {item.index}: GPU-Speicher voll (Versuch {attempt} von {attempts})"
+                    + (f"; {hint}" if hint else "")
+                    + f". Modell wird entladen, neuer Versuch in {wait} s."
+                    + (
+                        f" Ollama entladen: {', '.join(freed)}."
+                        if freed
+                        else " Wer jetzt Platz schafft, rettet den Lauf."
+                    )
                 )
                 report_progress(
                     self._progress, ProgressEvent("log", "tts", message, level="warning")
@@ -650,6 +660,31 @@ class ScriptRenderer:
                 self._drop_backend(item.voice)
                 if wait:
                     time.sleep(wait)
+
+    def _out_of_memory_advice(self, item: PreparedRenderChunk, attempts: int) -> str:
+        """Die Meldung, die am Ende wirklich gelesen wird.
+
+        Ein blosses "out of memory" laesst offen, was zu tun ist. Wer den
+        Speicher haelt und wie es weitergeht, steht deshalb hier drin.
+        """
+        run_dir = item.wav_path.parent.parent
+        lines = [
+            f"Chatterbox hat nach {attempts} Versuchen keinen GPU-Speicher bekommen "
+            f"(Segment {item.index}).",
+        ]
+        hint = gpu_memory_hint()
+        if hint:
+            lines.append(f"Belegung: {hint}.")
+        lines.append(
+            "Abhilfe: ein Ollama-Modell entladen (`ollama stop <modell>`), ein laufendes "
+            "Spiel beenden, oder `tts.chatterbox.device: cpu` setzen (langsamer, aber unabhaengig)."
+        )
+        if self.config.tts.reuse_segments:
+            lines.append(
+                f"Fertige Segmente bleiben erhalten, fortsetzen mit: "
+                f"codcast rerender {run_dir} --reuse-segments"
+            )
+        return " ".join(lines)
 
     def _render_chunk_atomically(self, item: PreparedRenderChunk) -> None:
         """Erst vollstaendig schreiben, dann umbenennen.
@@ -673,6 +708,71 @@ class ScriptRenderer:
 def _is_out_of_memory(error: BaseException) -> bool:
     text = str(error).lower()
     return "out of memory" in text or "outofmemoryerror" in text
+
+
+def _run_text(command: list[str], timeout: int = 15) -> str | None:
+    """Fremdwerkzeug aufrufen und None liefern, wenn es fehlt oder klemmt."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _nvidia_smi(*args: str) -> str | None:
+    return _run_text(["nvidia-smi", *args], timeout=5)
+
+
+def free_ollama_models() -> list[str]:
+    """Geladene Ollama-Modelle entladen und die Namen zurueckgeben.
+
+    Nur auf ausdruecklichen Wunsch (`tts.gpu_oom_free_ollama`), denn hier
+    greift der Renderer in einen fremden Dienst. Auf einem Rechner, auf dem
+    Diktieren ein Modell in den VRAM legt und es dort minutenlang haelt, ist
+    genau das aber der Unterschied zwischen fertigem Podcast und Abbruch:
+    Nachladen kostet Sekunden, ein abgebrochener Lauf Minuten.
+    """
+    listing = _run_text(["ollama", "ps"])
+    if listing is None:
+        return []
+    stopped: list[str] = []
+    # Erste Zeile ist die Kopfzeile; ohne geladenes Modell bleibt nur sie uebrig.
+    for line in listing.splitlines()[1:]:
+        columns = line.split()
+        if not columns:
+            continue
+        if _run_text(["ollama", "stop", columns[0]]) is not None:
+            stopped.append(columns[0])
+    return stopped
+
+
+def gpu_memory_hint() -> str | None:
+    """Wer den VRAM gerade belegt, in einer Zeile.
+
+    Eine Wiederholung nach Speichermangel nuetzt nur, wenn jemand den Platz
+    freigibt. Dafuer muss dastehen, welches Programm ihn haelt: ein
+    Ollama-Modell laesst sich in Sekunden entladen, ein Browser nicht.
+    Ohne nvidia-smi (CPU-Pfad, AMD) gibt es eben keinen Hinweis.
+    """
+    free = _nvidia_smi("--query-gpu=memory.free", "--format=csv,noheader,nounits")
+    if free is None or not free.strip():
+        return None
+    holders: list[tuple[int, str]] = []
+    apps = _nvidia_smi("--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
+    for line in (apps or "").splitlines():
+        raw_pid, _, raw_used = line.partition(",")
+        try:
+            megabytes = int(raw_used.strip())
+            name = Path(f"/proc/{int(raw_pid.strip())}/comm").read_text(encoding="utf-8").strip()
+        except (ValueError, OSError):
+            continue
+        holders.append((megabytes, name))
+    holders.sort(reverse=True)
+    hint = f"frei sind {free.strip().splitlines()[0]} MiB"
+    if not holders:
+        return hint
+    belegt = ", ".join(f"{name} {megabytes} MiB" for megabytes, name in holders[:3])
+    return f"{hint}; groesste Belegung: {belegt}"
 
 
 def rendered_segment_for_chunk(item: PreparedRenderChunk) -> RenderedSegment:

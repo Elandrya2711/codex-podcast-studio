@@ -256,10 +256,18 @@ class TTSConfig(ConfigModel):
     # alle 149 fertigen Segmente. `rerender` schaltet es ab, denn dort ist ein
     # neuer Take die Absicht.
     reuse_segments: bool = True
-    # Auf einer geteilten GPU ist ein Speicherfehler meist voruebergehend:
-    # ein Spiel oder ein anderes Modell gibt kurz darauf wieder Platz frei.
-    gpu_oom_retries: int = 2
-    gpu_oom_wait_sec: int = 20
+    # Auf einer geteilten GPU haelt ein anderes Programm den Speicher oft
+    # laenger als ein paar Sekunden: ein geladenes Ollama-Modell bleibt je nach
+    # Haltezeit viele Minuten liegen. Die Wartezeit ist deshalb vor allem dazu
+    # da, dass ein Mensch die Warnung liest und Platz schafft, bevor der Lauf
+    # aufgibt. Vier Versuche mal 30 Sekunden sind zwei Minuten Reaktionszeit.
+    gpu_oom_retries: int = 4
+    gpu_oom_wait_sec: int = 30
+    # Bei Speichermangel geladene Ollama-Modelle entladen. Standard aus, denn
+    # damit greift der Renderer in einen fremden Dienst. Wer Ollama nebenbei
+    # nutzt, etwa zum Diktieren, will es meist an: das Modell laedt in Sekunden
+    # nach, ein abgebrochener Podcast kostet Minuten.
+    gpu_oom_free_ollama: bool = False
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     chatterbox: ChatterboxConfig = Field(default_factory=ChatterboxConfig)
     kokoro: KokoroConfig = Field(default_factory=KokoroConfig)
