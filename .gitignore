@@ -18,3 +18,4 @@ voices/**/*.mp3
 voices/**/*.flac
 voices/**/*.zip
 models/
+tasks/
