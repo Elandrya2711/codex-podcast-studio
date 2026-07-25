@@ -56,6 +56,8 @@ Das legt `.venv-chatterbox` an und installiert `chatterbox-tts` dort. Eine eigen
 
 `setuptools<81` wird mitinstalliert, weil das Wasserzeichen-Paket `resemble-perth` noch `pkg_resources` importiert. Ohne das faellt der Watermarker still auf `None` und Chatterbox startet nicht.
 
+Referenzaufnahmen liegen diesem Repository bewusst nicht bei. Die Beispielkonfiguration verweist auf `voices/chatterbox/host-m.wav`, diese Datei bringst du selbst mit. Eine Referenz ist entweder eine fremde Aufnahme oder die Ausgabe eines fremden TTS-Dienstes, und in beiden Faellen laesst sich eine Stimme nicht einfach weiterverteilen. Mitgeliefert ist deshalb der Weg dorthin, nicht das Material: `voices extract` schneidet aus einer eigenen Aufnahme Klonmaterial, `voices import` uebernimmt es.
+
 Zwei Referenzstimmen importieren, je 8 bis 15 Sekunden sauber gesprochenes Deutsch ohne Hintergrundgeraeusche:
 
 ```bash
