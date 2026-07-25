@@ -222,6 +222,7 @@ class ChatterboxBackend(TTSBackend):
 
         chatterbox = self.config.tts.chatterbox
         spoken = normalize_for_tts(text) if chatterbox.normalize_text else text
+        spoken = _pad_short_text(spoken, chatterbox.min_text_chars)
         for attempt in range(chatterbox.max_retries + 1):
             seconds = self._render_once(spoken, voice, output_path)
             problem = _implausible_duration(spoken, seconds, chatterbox)
@@ -587,7 +588,24 @@ class ScriptRenderer:
     def _render_prepared_chunk(self, item: PreparedRenderChunk) -> None:
         if self._reuse_finished_segment(item):
             return
-        self._render_chunk_with_oom_retry(item)
+        try:
+            self._render_chunk_with_oom_retry(item)
+        except Exception as error:
+            # Egal woran ein Segment scheitert: die fertigen sind gerettet, und
+            # der Weg zurueck gehoert in die Meldung, nicht ins Handbuch.
+            hint = self._resume_hint(item)
+            if not hint or hint in str(error):
+                raise
+            raise RuntimeError(f"{error} {hint}") from error
+
+    def _resume_hint(self, item: PreparedRenderChunk) -> str:
+        if not self.config.tts.reuse_segments:
+            return ""
+        run_dir = item.wav_path.parent.parent
+        return (
+            "Fertige Segmente bleiben erhalten, fortsetzen mit: "
+            f"codcast rerender {run_dir} --reuse-segments"
+        )
 
     def _fingerprint_path(self, item: PreparedRenderChunk) -> Path:
         return item.wav_path.with_name(f"{item.wav_path.stem}.fingerprint.json")
@@ -667,23 +685,20 @@ class ScriptRenderer:
         Ein blosses "out of memory" laesst offen, was zu tun ist. Wer den
         Speicher haelt und wie es weitergeht, steht deshalb hier drin.
         """
-        run_dir = item.wav_path.parent.parent
         lines = [
             f"Chatterbox hat nach {attempts} Versuchen keinen GPU-Speicher bekommen "
             f"(Segment {item.index}).",
         ]
-        hint = gpu_memory_hint()
-        if hint:
-            lines.append(f"Belegung: {hint}.")
+        belegung = gpu_memory_hint()
+        if belegung:
+            lines.append(f"Belegung: {belegung}.")
         lines.append(
             "Abhilfe: ein Ollama-Modell entladen (`ollama stop <modell>`), ein laufendes "
             "Spiel beenden, oder `tts.chatterbox.device: cpu` setzen (langsamer, aber unabhaengig)."
         )
-        if self.config.tts.reuse_segments:
-            lines.append(
-                f"Fertige Segmente bleiben erhalten, fortsetzen mit: "
-                f"codcast rerender {run_dir} --reuse-segments"
-            )
+        resume = self._resume_hint(item)
+        if resume:
+            lines.append(resume)
         return " ".join(lines)
 
     def _render_chunk_atomically(self, item: PreparedRenderChunk) -> None:
@@ -703,6 +718,24 @@ class ScriptRenderer:
             encoding="utf-8",
         )
         os.replace(pending, item.wav_path)
+
+
+def _pad_short_text(text: str, minimum: int) -> str:
+    """Sehr kurze Zeilen auffuellen, sonst stuerzt Chatterbox ab.
+
+    Der alignment_stream_analyzer rechnet `A[completed_at:, :-5]`, schneidet
+    also die letzten fuenf Text-Spalten weg. Bleibt nichts uebrig, wirft
+    `max()` einen IndexError und der ganze Lauf steht. Gemessen: "B." (zwei
+    Tokens) stuerzt ab, "Ja?" (drei) laeuft, "B. .." laeuft mit 0,82 s.
+
+    Aufgefuellt wird mit Zeichen, die nicht gesprochen werden, das Ergebnis
+    klingt also unveraendert und wird nur minimal laenger. Eine Ellipse allein
+    genuegt nicht: "..." zaehlt als ein Token, "B..." stuerzt weiter ab.
+    """
+    stripped = text.strip()
+    if not stripped or len(stripped) >= minimum:
+        return text
+    return f"{stripped} .."
 
 
 def _is_out_of_memory(error: BaseException) -> bool:

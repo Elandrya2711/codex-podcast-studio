@@ -365,3 +365,54 @@ def test_the_final_error_says_what_to_do(backend, no_waiting, monkeypatch, tmp_p
     # Die eigentliche Ursache darf nicht verloren gehen.
     assert isinstance(failure.value.__cause__, RuntimeError)
     assert "out of memory" in str(failure.value.__cause__).lower()
+
+
+@pytest.mark.parametrize(
+    ("roh", "erwartet"),
+    [
+        # Gemessen an Chatterbox: zwei Text-Tokens stuerzen ab, drei laufen.
+        ("B.", "B. .."),
+        ("Ja?", "Ja? .."),
+        ("Hmm.", "Hmm. .."),
+        # Ab der Schwelle bleibt der Text unangetastet.
+        ("Stock.", "Stock."),
+        ("Sag es.", "Sag es."),
+        ("Ein ganz normaler Satz.", "Ein ganz normaler Satz."),
+        # Leer bleibt leer, hier ist nichts zu retten.
+        ("", ""),
+        ("   ", "   "),
+    ],
+    ids=["zwei-zeichen", "drei-zeichen", "vier-zeichen", "genau-sechs", "sieben", "normal", "leer", "nur-leerraum"],
+)
+def test_very_short_lines_are_padded_with_unspoken_characters(roh, erwartet):
+    assert tts._pad_short_text(roh, 6) == erwartet
+
+
+def test_padding_threshold_is_configurable():
+    assert tts._pad_short_text("Hmm.", 0) == "Hmm."
+    assert tts._pad_short_text("Ein Satz.", 40) == "Ein Satz. .."
+
+
+def test_any_segment_failure_says_how_to_continue(backend, no_waiting, tmp_path: Path):
+    # Der echte Fall: Chatterbox stirbt an einer zu kurzen Zeile, nicht am Speicher.
+    backend.failures = [RuntimeError("IndexError: max(): Expected reduction dim 1 to have non-zero size.")]
+
+    with pytest.raises(RuntimeError) as failure:
+        _render(AppConfig(), _script("Erste Zeile."), tmp_path, _voice())
+
+    message = str(failure.value)
+    assert "IndexError" in message, "die Ursache bleibt lesbar"
+    assert f"codcast rerender {tmp_path} --reuse-segments" in message
+    assert len(backend.render_calls()) == 1, "kein Wiederholen, das war kein Speicherfehler"
+
+
+def test_the_resume_hint_is_omitted_when_nothing_is_kept(backend, no_waiting, tmp_path: Path):
+    config = AppConfig()
+    config.tts.reuse_segments = False
+    backend.failures = [RuntimeError("worker died")]
+
+    with pytest.raises(RuntimeError) as failure:
+        _render(config, _script("Erste Zeile."), tmp_path, _voice())
+
+    # Ohne Wiederverwendung waere der Rat falsch: der naechste Lauf faengt vorn an.
+    assert "rerender" not in str(failure.value)

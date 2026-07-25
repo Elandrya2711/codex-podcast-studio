@@ -138,6 +138,9 @@ tts:
     repetition_penalty: 2.0
     # Schreibt Zahlen und Kuerzel aus; ohne das wird "48-Volt" zu "88 Volt".
     normalize_text: true
+    # Kuerzere Zeilen werden mit ungesprochenen Zeichen aufgefuellt, sonst
+    # stuerzt Chatterbox an Einwuerfen wie "B." ab.
+    min_text_chars: 6
     # Wiederholungs-Loops und Abbrueche an der Segmentdauer erkennen und neu rendern.
     max_retries: 2
     min_duration_ratio: 0.45

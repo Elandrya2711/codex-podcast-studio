@@ -150,6 +150,10 @@ class ChatterboxConfig(ConfigModel):
     repetition_penalty: float = 2.0
     # Zahlen und Kuerzel ausschreiben; ohne das wird aus "48-Volt" gemessen "88 Volt".
     normalize_text: bool = True
+    # Kuerzere Zeilen werden mit ungesprochenen Zeichen aufgefuellt. Chatterbox
+    # stuerzt sonst ab: bei zwei Text-Tokens ist die Alignment-Matrix leer.
+    # Gemessen: "B." stuerzt ab, "Ja?" laeuft. Sechs Zeichen sind Sicherheitsabstand.
+    min_text_chars: int = 6
     # Schutz gegen Wiederholungs-Loops: das Modell spricht gelegentlich einen Satz
     # zweimal, was die Segmentdauer weit ueber das Erwartbare treibt. Solche
     # Segmente werden neu gerendert.

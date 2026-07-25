@@ -117,6 +117,12 @@ Eine niedrigere `temperature` reduziert gelegentliche Aussprachefehler, weil das
 
 Chatterbox spricht gelegentlich einen Satz zweimal oder bricht mitten drin ab. Beides erkennt das Backend an der Segmentdauer im Vergleich zur Textlaenge und rendert das Segment neu (`max_retries`, Standard 2). Bleibt es auffaellig, erscheint eine Warnung auf stderr, statt still ein kaputtes Segment auszuliefern. Die Schwellen sind ueber `min_duration_ratio`, `max_duration_ratio` und `chars_per_second` einstellbar.
 
+### Sehr kurze Zeilen
+
+An einer Zeile wie `B.` stirbt Chatterbox mit `IndexError: max(): Expected reduction dim 1 to have non-zero size`. Der `alignment_stream_analyzer` rechnet `A[completed_at:, :-5]`, schneidet also die letzten fuenf Text-Spalten weg; bei zwei Text-Tokens bleibt nichts uebrig. Gemessen: `B.` stuerzt ab, `Ja?` laeuft, und eine Ellipse hilft nicht, weil `...` als ein Token zaehlt.
+
+Zeilen unter `min_text_chars` Zeichen (Standard 6) werden deshalb mit ungesprochenen Zeichen aufgefuellt. Das Ergebnis klingt gleich und wird nur minimal laenger: aus `B.` wird `B. ..` mit 0,82 Sekunden. In Comedy-Skripten mit kurzen Einwuerfen ist das kein Randfall, sondern die Regel.
+
 ### VRAM neben anderen Programmen
 
 Der Worker setzt `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, damit die Synthese nicht an Fragmentierung scheitert, wenn parallel ein Spiel oder ein Ollama-Modell auf der GPU liegt. Bleiben weniger als etwa 5 GB frei, reicht es trotzdem nicht: dann entweder ein Modell entladen (`ollama stop <modell>`) oder `tts.chatterbox.device: cpu` setzen. CPU funktioniert, ist aber deutlich langsamer.
