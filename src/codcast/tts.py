@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import builtins
+import json
 import os
+import queue
+import subprocess
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +20,8 @@ import soundfile as sf
 from .config import AppConfig, VoiceProfile
 from .models import PodcastScript, RenderedSegment, ScriptLine
 from .progress import CancellationToken, ProgressEvent, ProgressReporter, report_progress
+from .text_normalization import normalize_for_tts
+from .util import run_checked
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,188 @@ class KokoroBackend(TTSBackend):
             raise RuntimeError(f"Kokoro produced no audio for voice {voice.id}")
         audio = np.concatenate(chunks)
         sf.write(output_path, audio, self.sample_rate)
+
+
+class ChatterboxBackend(TTSBackend):
+    """Chatterbox Multilingual ueber einen persistenten Worker-Prozess.
+
+    Der Worker laeuft in einer eigenen venv und haelt das Modell im VRAM, damit
+    nicht jedes Segment die 3 GB Gewichte neu laedt. Kommuniziert wird mit einer
+    JSON-Zeile pro Job (siehe workers/chatterbox_worker.py).
+    """
+
+    WORKER = Path(__file__).parent / "workers" / "chatterbox_worker.py"
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self._process: subprocess.Popen[str] | None = None
+        self._events: queue.Queue[dict | None] = queue.Queue()
+        self._stderr_tail: list[str] = []
+        self._sample_rate: int | None = None
+        self._next_id = 0
+        self._lock = threading.Lock()
+        # Segmente, die auch nach den Wiederholungen auffaellig blieben.
+        self.warnings: list[str] = []
+        atexit.register(self.close)
+
+    def _start_worker(self) -> None:
+        chatterbox = self.config.tts.chatterbox
+        python = chatterbox.python_executable
+        if not python.exists():
+            raise RuntimeError(
+                f"Chatterbox-Python nicht gefunden: {python}. "
+                "Einmalig einrichten mit `uv run codcast setup-chatterbox`, "
+                "oder tts.chatterbox.python_executable in podcast.yml anpassen."
+            )
+        if not self.WORKER.exists():
+            raise RuntimeError(f"Chatterbox-Worker fehlt: {self.WORKER}")
+
+        self._process = subprocess.Popen(
+            [str(python), "-u", str(self.WORKER), chatterbox.device],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(target=self._read_events, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+        ready = self._await_event(chatterbox.startup_timeout_sec, "Modellstart")
+        if ready.get("event") != "ready":
+            raise RuntimeError(f"Chatterbox-Worker meldete kein ready: {ready}. {self._log_hint()}")
+        self._sample_rate = ready.get("sample_rate")
+
+    def _read_events(self) -> None:
+        assert self._process is not None and self._process.stdout is not None
+        for line in self._process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self._events.put(json.loads(line))
+            except json.JSONDecodeError:
+                self._stderr_tail.append(f"stdout: {line[:200]}")
+        self._events.put(None)
+
+    def _read_stderr(self) -> None:
+        assert self._process is not None and self._process.stderr is not None
+        for line in self._process.stderr:
+            self._stderr_tail.append(line.rstrip())
+            del self._stderr_tail[:-60]
+
+    def _log_hint(self) -> str:
+        if not self._stderr_tail:
+            return ""
+        return "Letzte Worker-Ausgabe:\n" + "\n".join(self._stderr_tail[-15:])
+
+    def _await_event(self, timeout_sec: int, what: str) -> dict:
+        try:
+            event = self._events.get(timeout=timeout_sec)
+        except queue.Empty as exc:
+            self.close()
+            raise RuntimeError(f"Chatterbox-Worker antwortete nicht ({what}, {timeout_sec}s). {self._log_hint()}") from exc
+        if event is None:
+            code = self._process.poll() if self._process else None
+            self.close()
+            raise RuntimeError(f"Chatterbox-Worker beendet (exit {code}) waehrend {what}. {self._log_hint()}")
+        return event
+
+    def render(self, text: str, voice: VoiceProfile, output_path: Path) -> None:
+        if not voice.speaker_wav:
+            raise ValueError(
+                f"Chatterbox-Stimme {voice.id} braucht speaker_wav. "
+                "Referenz importieren mit `codcast voices import --backend chatterbox ...`."
+            )
+        if not voice.speaker_wav.exists():
+            raise FileNotFoundError(f"Chatterbox reference not found: {voice.speaker_wav}")
+
+        chatterbox = self.config.tts.chatterbox
+        spoken = normalize_for_tts(text) if chatterbox.normalize_text else text
+        for attempt in range(chatterbox.max_retries + 1):
+            seconds = self._render_once(spoken, voice, output_path)
+            problem = _implausible_duration(spoken, seconds, chatterbox)
+            if problem is None:
+                break
+            if attempt == chatterbox.max_retries:
+                warning = f"Segment bleibt nach {attempt + 1} Versuchen auffaellig ({problem}): {spoken[:70]}"
+                self.warnings.append(warning)
+                print(f"[chatterbox] {warning}", file=sys.stderr)
+                break
+
+        if voice.speed != 1.0:
+            _apply_tempo(output_path, voice.speed)
+
+    def _render_once(self, spoken: str, voice: VoiceProfile, output_path: Path) -> float:
+        chatterbox = self.config.tts.chatterbox
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._start_worker()
+            assert self._process is not None and self._process.stdin is not None
+            self._next_id += 1
+            job_id = self._next_id
+            job = {
+                "id": job_id,
+                "text": spoken,
+                "reference": str(voice.speaker_wav),
+                "output_path": str(output_path),
+                "language": voice.language.split("-")[0] or chatterbox.language,
+                "exaggeration": _first_set(voice.chatterbox_exaggeration, chatterbox.exaggeration),
+                "cfg_weight": _first_set(voice.chatterbox_cfg_weight, chatterbox.cfg_weight),
+                "temperature": _first_set(voice.chatterbox_temperature, chatterbox.temperature),
+                "repetition_penalty": chatterbox.repetition_penalty,
+            }
+            self._process.stdin.write(json.dumps(job) + "\n")
+            self._process.stdin.flush()
+
+            while True:
+                event = self._await_event(chatterbox.timeout_sec, f"Segment {job_id}")
+                if event.get("id") == job_id:
+                    break
+            if event.get("event") != "done":
+                raise RuntimeError(
+                    f"Chatterbox konnte Segment nicht rendern: {event.get('message')}. {self._log_hint()}"
+                )
+            return float(event.get("seconds") or 0.0)
+
+    def close(self) -> None:
+        process, self._process = self._process, None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=10)
+        except Exception:
+            process.kill()
+
+
+def _first_set(voice_value: float | None, config_value: float) -> float:
+    return config_value if voice_value is None else voice_value
+
+
+def _implausible_duration(text: str, seconds: float, chatterbox) -> str | None:
+    """Grobe Plausibilitaetspruefung der Segmentdauer.
+
+    Ein Wiederholungs-Loop verdoppelt die Dauer, ein Abbruch halbiert sie. Beides
+    laesst sich an der erwarteten Sprechdauer erkennen, ohne das Audio zu verstehen.
+    """
+    if seconds <= 0:
+        return "keine Dauer gemeldet"
+    expected = max(len(text) / chatterbox.chars_per_second, 1.0)
+    if seconds > expected * chatterbox.max_duration_ratio:
+        return f"{seconds:.1f}s statt erwarteter {expected:.1f}s, moeglicher Wiederholungs-Loop"
+    if seconds < expected * chatterbox.min_duration_ratio:
+        return f"{seconds:.1f}s statt erwarteter {expected:.1f}s, moeglicher Abbruch"
+    return None
+
+
+def _apply_tempo(path: Path, speed: float) -> None:
+    if not 0.5 <= speed <= 2.0:
+        raise ValueError(f"speed must be between 0.5 and 2.0 for tempo adjustment, got {speed}")
+    adjusted = path.with_name(f"{path.stem}.tempo{path.suffix}")
+    run_checked(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-filter:a", f"atempo={speed:.4f}", str(adjusted)])
+    adjusted.replace(path)
 
 
 class XttsBackend(TTSBackend):
@@ -234,6 +424,8 @@ class FishBackend(TTSBackend):
 
 
 def backend_for_voice(config: AppConfig, voice: VoiceProfile) -> TTSBackend:
+    if voice.backend == "chatterbox":
+        return ChatterboxBackend(config)
     if voice.backend == "fish":
         return FishBackend(config)
     if voice.backend == "kokoro":
@@ -306,9 +498,18 @@ class ScriptRenderer:
                 )
             )
 
-        if self._should_render_openai_chunks_parallel(prepared):
-            return self._render_prepared_chunks_parallel(prepared, total, progress, cancellation)
-        return self._render_prepared_chunks_serial(prepared, total, progress, cancellation)
+        try:
+            if self._should_render_openai_chunks_parallel(prepared):
+                return self._render_prepared_chunks_parallel(prepared, total, progress, cancellation)
+            return self._render_prepared_chunks_serial(prepared, total, progress, cancellation)
+        finally:
+            # Lokale Modelle geben ihren VRAM frei, bevor Assembly und Export laufen.
+            self.close()
+
+    def close(self) -> None:
+        for backend in self.backends.values():
+            close_backend(backend)
+        self.backends.clear()
 
     def _should_render_openai_chunks_parallel(self, prepared: list[PreparedRenderChunk]) -> bool:
         return self.config.tts.openai.concurrency > 1 and len(prepared) > 1 and all(item.voice.backend == "openai" for item in prepared)
@@ -388,7 +589,18 @@ def rendered_segment_for_chunk(item: PreparedRenderChunk) -> RenderedSegment:
 
 def render_voice_sample(config: AppConfig, voice: VoiceProfile, text: str, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    backend_for_voice(config, voice).render(text, voice, output_path)
+    backend = backend_for_voice(config, voice)
+    try:
+        backend.render(text, voice, output_path)
+    finally:
+        # Sonst stapeln sich bei mehreren Samples in einem Prozess die Worker im VRAM.
+        close_backend(backend)
+
+
+def close_backend(backend: TTSBackend) -> None:
+    close = getattr(backend, "close", None)
+    if callable(close):
+        close()
 
 
 def group_single_speaker_openai_lines(lines: list[ScriptLine], max_chars: int) -> list[ScriptRenderChunk]:

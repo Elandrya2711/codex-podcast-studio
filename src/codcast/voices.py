@@ -19,6 +19,8 @@ def backend_for_quality(config: AppConfig, quality: str | None = None) -> str:
     selected = quality or config.tts.quality
     if selected == "best":
         return config.tts.backend
+    if selected == "chatterbox":
+        return "chatterbox"
     if selected == "fast":
         return "kokoro"
     if selected == "openai":
@@ -28,13 +30,47 @@ def backend_for_quality(config: AppConfig, quality: str | None = None) -> str:
     return config.tts.backend
 
 
-def select_voice_profiles(config: AppConfig, speaker_count: int, quality: str | None = None) -> list[VoiceProfile]:
+def voice_set_members(config: AppConfig, name: str) -> list[VoiceProfile]:
+    """Profile einer benannten Besetzung, in der konfigurierten Reihenfolge."""
+    members = config.tts.voice_sets.get(name)
+    if not members:
+        raise ValueError(f"unknown voice set: {name}")
+    by_id = {voice.id: voice for voice in config.tts.voices}
+    missing = [member for member in members if member not in by_id]
+    if missing:
+        raise ValueError(f"voice set {name} references unknown voice profiles: {', '.join(missing)}")
+    return [by_id[member] for member in members]
+
+
+def select_voice_profiles(
+    config: AppConfig,
+    speaker_count: int,
+    quality: str | None = None,
+    voice_set: str | None = None,
+) -> list[VoiceProfile]:
     if speaker_count < 1:
         raise ValueError("speaker_count must be at least 1")
     if speaker_count > config.generation.max_speakers:
         raise ValueError(f"speaker_count cannot exceed {config.generation.max_speakers}")
 
     backend = backend_for_quality(config, quality)
+    selected_set = voice_set or config.tts.voice_set
+    if selected_set:
+        members = voice_set_members(config, selected_set)
+        mismatched = [voice.id for voice in members if voice.backend != backend]
+        if mismatched:
+            raise ValueError(
+                f"voice set {selected_set} contains voices for another backend than {backend}: "
+                f"{', '.join(mismatched)}"
+            )
+        if len(members) >= speaker_count:
+            return members[:speaker_count]
+        if config.tts.allow_voice_reuse:
+            return list(islice(cycle(members), speaker_count))
+        raise ValueError(
+            f"{speaker_count} voice(s) requested, but voice set {selected_set} only has {len(members)}. "
+            "Add more voices to the set or set tts.allow_voice_reuse=true."
+        )
     profiles = [voice for voice in config.tts.voices if voice.backend == backend]
     if len(profiles) >= speaker_count:
         return profiles[:speaker_count]
@@ -45,6 +81,11 @@ def select_voice_profiles(config: AppConfig, speaker_count: int, quality: str | 
         raise ValueError(
             f"{speaker_count} XTTS voice profile(s) requested, but only {len(profiles)} configured. "
             "Import private reference voices with `codcast voices import ...`."
+        )
+    if backend == "chatterbox":
+        raise ValueError(
+            f"{speaker_count} Chatterbox voice profile(s) requested, but only {len(profiles)} configured. "
+            "Import reference voices with `codcast voices import --backend chatterbox ...`."
         )
     if backend == "fish":
         raise ValueError(

@@ -5,10 +5,10 @@ from datetime import datetime
 from pathlib import Path
 
 from .audio import assemble_episode
-from .codex_runner import CodexRunner
 from .config import AppConfig, config_to_yaml
 from .deep_research import DeepResearchEngine, ResearchProviderError
 from .duration import duration_status, script_word_count
+from .llm import LLMRunner, runner_for_config
 from .local_evidence import LocalEvidenceCollector
 from .models import LocalEvidenceReport, PodcastScript, ResearchReport, RunManifest, ScriptLine, ValidationReport
 from .progress import CancellationToken, ProgressEvent, ProgressReporter, report_progress
@@ -45,10 +45,27 @@ def _safe_output_stem(run_id: str, *, source: str = "run_id") -> str:
 
 
 class PodcastGenerator:
-    def __init__(self, config: AppConfig, project_root: Path) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        project_root: Path,
+        runner: LLMRunner | None = None,
+    ) -> None:
         self.config = config
         self.project_root = project_root
-        self.runner = CodexRunner(config.codex, project_root)
+        self._runner = runner
+
+    @property
+    def runner(self) -> LLMRunner:
+        # Resolved lazily so runs that only re-render audio from existing
+        # artifacts do not require the provider CLI to be installed.
+        if self._runner is None:
+            self._runner = runner_for_config(self.config, self.project_root)
+        return self._runner
+
+    @runner.setter
+    def runner(self, value: LLMRunner) -> None:
+        self._runner = value
 
     def _run_dir(self, topic: str) -> tuple[str, Path]:
         now = datetime.now()
@@ -170,8 +187,8 @@ class PodcastGenerator:
                     model=ResearchReport,
                     progress=progress,
                     cancellation=cancellation,
-                    timeout_sec=max(self.config.codex.timeout_sec, 2400),
-                    config_overrides={"model_reasoning_effort": "xhigh"},
+                    timeout_sec=max(self.config.llm_timeout_sec, 2400),
+                    reasoning=self.config.llm_deep_reasoning,
                     live_search=False,
                 )
                 report_progress(progress, ProgressEvent("done", "research", "Finale Recherche aus Dossier erstellt"))
@@ -297,8 +314,8 @@ class PodcastGenerator:
                 model=ResearchReport,
                 progress=progress,
                 cancellation=cancellation,
-                timeout_sec=max(self.config.codex.timeout_sec, 2400),
-                config_overrides={"model_reasoning_effort": "xhigh"},
+                timeout_sec=max(self.config.llm_timeout_sec, 2400),
+                reasoning=self.config.llm_deep_reasoning,
                 live_search=False,
             )
             report_progress(progress, ProgressEvent("done", "research", "Finale Recherche aus Dossier erstellt"))
@@ -424,8 +441,8 @@ class PodcastGenerator:
                 model=ResearchReport,
                 progress=progress,
                 cancellation=cancellation,
-                timeout_sec=max(self.config.codex.timeout_sec, 2400),
-                config_overrides={"model_reasoning_effort": "xhigh"},
+                timeout_sec=max(self.config.llm_timeout_sec, 2400),
+                reasoning=self.config.llm_deep_reasoning,
                 live_search=False,
             )
             research_path.write_text(research.model_dump_json(indent=2), encoding="utf-8")
@@ -436,8 +453,8 @@ class PodcastGenerator:
                 model=ValidationReport,
                 progress=progress,
                 cancellation=cancellation,
-                timeout_sec=max(self.config.codex.timeout_sec, 2400),
-                config_overrides={"model_reasoning_effort": "xhigh"},
+                timeout_sec=max(self.config.llm_timeout_sec, 2400),
+                reasoning=self.config.llm_deep_reasoning,
                 live_search=False,
             )
             validation_path.write_text(validation.model_dump_json(indent=2), encoding="utf-8")

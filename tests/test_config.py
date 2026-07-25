@@ -11,9 +11,9 @@ def test_load_default_config_from_missing_file(tmp_path: Path):
     assert config.research.depth == "standard"
     assert config.research.provider == "searxng"
     assert config.research.searxng_base_url == "http://127.0.0.1:8888"
-    assert config.tts.backend == "openai"
+    assert config.tts.backend == "chatterbox"
     assert config.tts.quality == "best"
-    assert [voice.backend for voice in config.tts.voices[:2]] == ["openai", "openai"]
+    assert [voice.backend for voice in config.tts.voices[:2]] == ["chatterbox", "chatterbox"]
 
 
 def test_load_config_merges_overrides(tmp_path: Path):

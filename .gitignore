@@ -1,4 +1,6 @@
 .venv/
+.venv-chatterbox/
+.venv-diarize/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

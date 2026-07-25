@@ -146,7 +146,7 @@ def test_deep_research_discovers_follow_up_queries(tmp_path: Path):
     assert (run_dir / "deep_research" / "evidence.jsonl").exists()
     assert (run_dir / "deep_research" / "research_dossier.md").exists()
     assert (run_dir / "deep_research" / "quality_report.json").exists()
-    assert any(call["kwargs"]["config_overrides"] == {"model_reasoning_effort": "xhigh"} for call in runner.calls)
+    assert any(call["kwargs"]["reasoning"] == "xhigh" for call in runner.calls)
     assert all(call["kwargs"]["live_search"] is False for call in runner.calls)
 
 

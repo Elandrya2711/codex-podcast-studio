@@ -31,6 +31,35 @@ def test_codex_command_supports_config_overrides(tmp_path: Path):
     assert cmd.index("-c") < cmd.index("exec")
 
 
+def test_codex_command_maps_reasoning_to_effort_override(tmp_path: Path):
+    runner = CodexRunner(CodexConfig(model="gpt-test"), tmp_path)
+    cmd = runner.build_command(
+        "prompt",
+        tmp_path / "schema.json",
+        tmp_path / "out.json",
+        reasoning="xhigh",
+    )
+
+    assert 'model_reasoning_effort="xhigh"' in cmd
+    assert cmd.index("-c") < cmd.index("exec")
+
+
+def test_codex_command_uses_configured_effort_and_prefers_per_call_reasoning(tmp_path: Path):
+    runner = CodexRunner(CodexConfig(model="gpt-test", effort="low"), tmp_path)
+
+    default_cmd = runner.build_command("prompt", tmp_path / "schema.json", tmp_path / "out.json")
+    assert 'model_reasoning_effort="low"' in default_cmd
+
+    override_cmd = runner.build_command(
+        "prompt",
+        tmp_path / "schema.json",
+        tmp_path / "out.json",
+        reasoning="max",
+    )
+    assert 'model_reasoning_effort="max"' in override_cmd
+    assert 'model_reasoning_effort="low"' not in override_cmd
+
+
 def test_codex_command_can_disable_live_search_per_call(tmp_path: Path):
     runner = CodexRunner(CodexConfig(model="gpt-test", live_search=True), tmp_path)
     cmd = runner.build_command("prompt", tmp_path / "schema.json", tmp_path / "out.json", live_search=False)

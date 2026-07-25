@@ -30,6 +30,7 @@ class CodexRunner:
         *,
         config_overrides: dict[str, object] | None = None,
         live_search: bool | None = None,
+        reasoning: str | None = None,
     ) -> list[str]:
         cmd = [self.config.executable]
         use_live_search = self.config.live_search if live_search is None else live_search
@@ -38,7 +39,11 @@ class CodexRunner:
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         cmd.extend(["--ask-for-approval", self.config.approval_policy])
-        for key, value in (config_overrides or {}).items():
+        overrides = dict(config_overrides or {})
+        effort = reasoning or self.config.effort
+        if effort and "model_reasoning_effort" not in overrides:
+            overrides["model_reasoning_effort"] = effort
+        for key, value in overrides.items():
             cmd.extend(["-c", f"{key}={_toml_literal(value)}"])
         cmd.extend(self.config.extra_args)
         cmd.extend(
@@ -71,6 +76,7 @@ class CodexRunner:
         timeout_sec: int | None = None,
         config_overrides: dict[str, object] | None = None,
         live_search: bool | None = None,
+        reasoning: str | None = None,
     ) -> T:
         schema_path = output_path.with_suffix(".schema.json")
         stdout_path = output_path.with_suffix(".stdout.log")
@@ -83,6 +89,7 @@ class CodexRunner:
             output_path,
             config_overrides=config_overrides,
             live_search=live_search,
+            reasoning=reasoning,
         )
         if progress:
             progress(ProgressEvent("log", schema_name, f"Starte Codex-Schritt: {schema_name}"))

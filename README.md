@@ -1,6 +1,8 @@
 # Codex Podcast Studio
 
-Codex Podcast Studio erzeugt aus einem Thema oder einer Fragestellung einen recherchierten Podcast: Codex CLI recherchiert, validiert Claims und schreibt ein Dialogskript; die Standard-Audioausgabe fuer `best` laeuft ueber OpenAI TTS, der schnelle lokale Fallback ueber Kokoro.
+Codex Podcast Studio erzeugt aus einem Thema oder einer Fragestellung einen recherchierten Podcast: eine Agent-CLI recherchiert, validiert Claims und schreibt ein Dialogskript; die Standard-Audioausgabe fuer `best` laeuft lokal auf der GPU ueber Chatterbox Multilingual, OpenAI TTS bleibt als bezahlte Alternative, Kokoro als schneller Fallback.
+
+Als LLM-Provider stehen **Claude (Standard, `claude-opus-5`)** und **Codex** zur Verfuegung, umschaltbar mit `--llm-provider`. Beide nutzen die jeweilige CLI mit dem vorhandenen Abo-Login, das Projekt speichert fuer den LLM-Pfad keinen API-Key.
 
 ## Lizenz
 
@@ -26,10 +28,12 @@ cp podcast.yml.example podcast.yml
 uv run codcast voices list
 ```
 
-Die Default-Konfiguration nutzt zwei OpenAI-TTS-Stimmen fuer `best`:
+Die Default-Konfiguration nutzt fuer `best` zwei lokale Chatterbox-Stimmen, die eine eigene Referenzaufnahme klonen:
 
-- `Cedar`: ruhiger Podcast-Host
-- `Marin`: analytische Podcast-Stimme
+- `Jonas`: maennlicher Host, erwartet `voices/chatterbox/host-m.wav`
+- `Mara`: weibliche Stimme, erwartet `voices/chatterbox/host-f.wav`
+
+Siehe [Chatterbox Setup](#chatterbox-setup-lokal-und-kostenlos). OpenAI TTS bleibt vollstaendig nutzbar (`--quality openai`) und kostet pro Podcast Geld.
 
 Der OpenAI-Key wird nicht aus `OPENAI_API_KEY` gelesen, sondern absichtlich aus `OPENAI_TTS_API_KEY` in `.env.tts.local`, damit er nur fuer TTS genutzt wird:
 
@@ -39,6 +43,81 @@ chmod 600 .env.tts.local
 ```
 
 `.env.tts.local` ist gitignoriert. Das Tool liest daraus nur den konfigurierten TTS-Key-Namen.
+
+## Chatterbox Setup (lokal und kostenlos)
+
+Chatterbox Multilingual (MIT-Lizenz) laeuft auf der GPU, klont eine Referenzstimme aus wenigen Sekunden Audio und kostet nichts pro Podcast. Auf der RTX 4080 SUPER braucht es rund 4 GB VRAM und rendert etwa doppelt so schnell wie Echtzeit.
+
+```bash
+uv run codcast setup-chatterbox
+```
+
+Das legt `.venv-chatterbox` an und installiert `chatterbox-tts` dort. Eine eigene venv ist Absicht: Chatterbox pinnt andere torch-Versionen als das Projekt. Die Modellgewichte (rund 3 GB) laedt der erste Lauf nach `~/.cache/huggingface`.
+
+`setuptools<81` wird mitinstalliert, weil das Wasserzeichen-Paket `resemble-perth` noch `pkg_resources` importiert. Ohne das faellt der Watermarker still auf `None` und Chatterbox startet nicht.
+
+Zwei Referenzstimmen importieren, je 8 bis 15 Sekunden sauber gesprochenes Deutsch ohne Hintergrundgeraeusche:
+
+```bash
+uv run codcast voices import --backend chatterbox --name chatterbox-host-m --wav /pfad/maennlich.wav
+uv run codcast voices import --backend chatterbox --name chatterbox-host-f --wav /pfad/weiblich.wav
+uv run codcast voices test chatterbox-host-m
+```
+
+Die Qualitaet des Ergebnisses haengt direkt an der Referenzaufnahme: eine studioreine Referenz klingt hoerbar besser als eine Hobbyaufnahme. Ein `ref_text` ist fuer Chatterbox nicht noetig.
+
+### Die Referenzaufnahme ist der groesste Hebel
+
+Sieben Referenzen derselben Sprecherin, gleicher Text, gleiche Parameter, je acht Takes: der Anteil fehlerhafter Takes lag zwischen 0 und 62 Prozent. Es lohnt sich also, mehrere Kandidaten durchzuprobieren, statt an den Parametern zu drehen. Was sich als Referenz bewaehrt hat:
+
+- 10 bis 12 Sekunden, ruhig gesprochener Fliesstext mit vollstaendigen Saetzen
+- keine Aufzaehlung einzelner Buchstaben (`P, R, N, D`), keine Ziffern, keine Abkuerzungen
+- echte Umlaute im gesprochenen Text: eine Referenz, in der jemand "fuer" statt "für" liest, vererbt genau das
+- laenger ist nicht besser: zwei aneinandergehaengte Aufnahmen (21 bis 23 Sekunden) waren in der Messung deutlich schlechter als eine einzelne gute
+
+### Mehrere Besetzungen nebeneinander
+
+Sobald mehr als ein Stimmpaar fuer dasselbe Backend konfiguriert ist, gewinnen sonst immer die ersten passenden Profile. Benannte Besetzungen machen die Wahl explizit:
+
+```yaml
+tts:
+  voice_set: standard
+  voice_sets:
+    standard: [chatterbox-host-m, chatterbox-host-f]
+    gaeste: [gast-a, gast-b]
+```
+
+Im Wizard erscheint dann eine Zeile `Stimmen` mit den verfuegbaren Besetzungen und den Anzeigenamen dahinter. Fuer Skripte gibt es `--voice-set gaeste` bei `generate` und `rerender`. Die Reihenfolge im Set bestimmt, welche Stimme Sprecher eins wird. Ein Set mit Profilen aus verschiedenen Backends wird abgelehnt, ebenso ein Set, das auf unbekannte Profile zeigt.
+
+### Warum Zahlen normalisiert werden
+
+`tts.chatterbox.normalize_text` (Standard `true`) schreibt Zahlen und Kuerzel vor der Synthese aus. Ohne das wurde gemessen aus `48-Volt` ein gesprochenes "88 Volt" und aus `MY2025` ein "Mai 1050". Das ist inhaltlich falsch, nicht nur unschoen. Betroffen sind Ziffern, Dezimalkommas, Jahre und kurze Grossbuchstaben-Kuerzel; als Wort gesprochene Kuerzel wie `ABS` oder `ESP` bleiben unangetastet (`src/codcast/text_normalization.py`).
+
+### Tempo und Betonung
+
+Die Defaults sind auf Deutsch gemessen: `exaggeration: 0.35`, `cfg_weight: 0.3`, `temperature: 0.6`. Hoehere Werte klingen aufgeregter und sprechen schneller. Das Sprechtempo laesst sich pro Stimme mit `speed` feinjustieren (`speed: 0.95` streckt die Ausgabe per ffmpeg um 5 Prozent), was die Laengenplanung ueber `generation.words_per_minute` treffsicherer macht.
+
+Wenn nur eine von mehreren Stimmen unruhig klingt, laesst sie sich einzeln nachschaerfen, ohne die anderen anzufassen. Nicht gesetzte Werte kommen weiter aus `tts.chatterbox`:
+
+```yaml
+  - id: chatterbox-host-f
+    display_name: Mara
+    backend: chatterbox
+    speaker_wav: voices/chatterbox/host-f.wav
+    chatterbox_temperature: 0.3   # weniger Streuung, weniger Ausrutscher
+    chatterbox_cfg_weight: 0.4    # naeher an der Referenz
+    speed: 0.95
+```
+
+Eine niedrigere `temperature` reduziert gelegentliche Aussprachefehler, weil das Modell weniger wuerfelt. Aber nicht beliebig weit: bei `0.3` trat im Test ein Wiederholungs-Loop auf, das Modell sprach einen kompletten Satz zweimal. Das ist der groebere Fehler. `0.45` hat sich als brauchbarer Kompromiss erwiesen.
+
+### Schutz gegen Wiederholungs-Loops
+
+Chatterbox spricht gelegentlich einen Satz zweimal oder bricht mitten drin ab. Beides erkennt das Backend an der Segmentdauer im Vergleich zur Textlaenge und rendert das Segment neu (`max_retries`, Standard 2). Bleibt es auffaellig, erscheint eine Warnung auf stderr, statt still ein kaputtes Segment auszuliefern. Die Schwellen sind ueber `min_duration_ratio`, `max_duration_ratio` und `chars_per_second` einstellbar.
+
+### VRAM neben anderen Programmen
+
+Der Worker setzt `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, damit die Synthese nicht an Fragmentierung scheitert, wenn parallel ein Spiel oder ein Ollama-Modell auf der GPU liegt. Bleiben weniger als etwa 5 GB frei, reicht es trotzdem nicht: dann entweder ein Modell entladen (`ollama stop <modell>`) oder `tts.chatterbox.device: cpu` setzen. CPU funktioniert, ist aber deutlich langsamer.
 
 Fish bleibt als optionaler Premium-/Experimentierpfad mit kuratierten Referenzstimmen:
 
@@ -158,7 +237,37 @@ Danach kannst du aus jedem Ordner starten:
 podcast
 ```
 
-Der Wizard fragt Thema, Sprecher, Mindestlaenge, Maximallaenge, Qualitaet, Recherche-Tiefe und Sprache ab. Er nutzt die zentrale Konfiguration `podcast.yml` aus diesem Checkout und schreibt die Ergebnisse in den dort konfigurierten Podcast-Ordner.
+Der Wizard fragt nur das Thema ab und zeigt danach **alle** Optionen als Liste. Eine Nummer aendert den jeweiligen Punkt, leere Eingabe startet den Podcast, `q` bricht ab. Kommandozeilen-Flags braucht man dafuer nicht.
+
+```
+Einstellungen:
+   1) Thema             Warum Kaffee muede machen kann
+   2) Sprecher          2
+   3) Laenge            10-15 Minuten
+   4) Audio-Qualitaet   best
+   5) Recherche-Tiefe   standard
+   6) LLM-Provider      claude
+   7) Modell            claude-opus-5
+   8) Reasoning-Effort  standard
+   9) Live-Websuche     ein
+  10) Audio rendern     ja
+  11) Sprache           de-DE
+      Ausgabe           /pfad/zu/podcasts
+
+Nummer aendern, leer = Podcast starten, q = abbrechen:
+```
+
+Jeder Unterpunkt listet die Auswahl mit Erklaerung, `>` markiert den aktuellen Wert. Auswahl per Nummer oder Name:
+
+```
+Claude-Modell:
+ > 1) opus    claude-opus-5, gute Balance (Standard)
+   2) fable   claude-fable-5, faehigstes Modell, hoeherer Verbrauch
+   3) sonnet  claude-sonnet-5, schnell und sparsam
+Auswahl [opus]:
+```
+
+Der Wizard nutzt die zentrale Konfiguration `podcast.yml` aus diesem Checkout als Startwerte und schreibt die Ergebnisse in den dort konfigurierten Podcast-Ordner. Dauerhafte Vorgaben aendert man in `podcast.yml`, dann stehen sie beim naechsten Start direkt im Menue.
 
 Nach der Bestaetigung oeffnet `podcast` eine Terminal-UI mit Live-Fortschritt, Schrittstatus, TTS-Segmentzaehler, kurzen Logs und Ergebnisuebersicht. Den gleichen Fortschrittsmodus gibt es auch fuer direkte CLI-Aufrufe:
 
@@ -191,7 +300,7 @@ uv run codcast generate "Thema" \
   --research-depth standard
 ```
 
-Fuer echte Tiefenrecherche gibt es `deep` und `dossier`. Diese Modi nutzen keine paid Search-API. Die Web-Suche laeuft ueber eine lokale SearXNG-Instanz, Seiteninhalte werden lokal per Trafilatura/Fallback-Extraktion verarbeitet. YouTube-Treffer werden lokal mit `yt-dlp` als Transkripte geholt und als Dossier-Quellen verarbeitet, sofern Untertitel verfuegbar sind. Codex bleibt das einzige paid Tool in diesem Pfad.
+Fuer echte Tiefenrecherche gibt es `deep` und `dossier`. Diese Modi nutzen keine paid Search-API. Die Web-Suche laeuft ueber eine lokale SearXNG-Instanz, Seiteninhalte werden lokal per Trafilatura/Fallback-Extraktion verarbeitet. YouTube-Treffer werden lokal mit `yt-dlp` als Transkripte geholt und als Dossier-Quellen verarbeitet, sofern Untertitel verfuegbar sind. Der LLM-Provider (Claude oder Codex) bleibt das einzige kostenpflichtige Tool in diesem Pfad, abgedeckt durch das jeweilige Abo.
 
 ```bash
 # Einmalig lokale Open-Source-Suche starten:
@@ -218,6 +327,39 @@ Die zentralen Regler stehen in `podcast.yml` unter `research`. Ohne Overrides la
 - `deep_research/research_dossier.json`
 - `deep_research/research_dossier.md`
 - `deep_research/quality_report.json`
+
+## Referenzstimmen Aus Einer Aufnahme Schneiden
+
+`voices import` erwartet ein fertiges WAV mit genau einer Stimme. Echtes Quellmaterial ist aber meist ein Gespraech. `voices extract` trennt die Sprecher und schneidet pro Person sauberes Klonmaterial:
+
+```bash
+uv run codcast setup-diarize          # einmalig, legt .venv-diarize an
+uv run codcast voices extract folge.mp3 --speakers 2 --minutes 5
+```
+
+Alles laeuft lokal. Bewusst ohne pyannote, dessen Modelle auf HuggingFace gated sind: hier arbeiten Silero VAD (MIT) und SpeechBrain ECAPA (Apache-2.0), beide frei ladbar, kein Token noetig.
+
+Ergebnis pro Sprecher in `voices/source_candidates/<name>/speaker_A/`: die einzelnen Chunks, eine zusammengesetzte und lautheitsnormalisierte Datei in Quellqualitaet, dieselbe in 24 kHz fuer den direkten Chatterbox-Import, sowie eine 30-Sekunden-Preview zum Zuordnen. `report.json` enthaelt alle Zeitstempel und Messwerte.
+
+### Warum Das Sauber Wird
+
+Das Clustering allein reicht nicht: an jedem Sprecherwechsel sitzt Ueberlappung, und die landet sonst im Klonmaterial. Zwei Filter danach machen den Unterschied.
+
+- **Randerosion**: von jedem zusammenhaengenden Lauf eines Sprechers fallen `erosion_sec` an beiden Enden weg, also genau die Uebergangszonen.
+- **Margin-Score**: pro Chunk die Aehnlichkeit zum eigenen minus die zum fremden Sprecherzentroid. Ueberlappende Rede, Musikbett und Stoergeraeusche druecken ihn automatisch, ohne dass es dafuer eigene Detektoren braucht.
+
+Ausgewaehlt wird dann nicht stur nach Score, sondern per Round-Robin ueber zehn Zeit-Bins. Das kostet etwas Margin und bringt Prosodie-Varianz, die beim Klonen mehr wiegt als die eine gleichmaessigste Passage.
+
+Findet `--minutes` nicht genug Material, kommt zurueck was da ist, mit Angabe der tatsaechlichen Dauer. Die Schwellen werden nicht still aufgeweicht.
+
+### Ergebnis Pruefen
+
+Der Lauf misst am Ende die fertigen Dateien nach und gibt zwei Zahlen aus:
+
+- **Aehnlichkeit zwischen den Sprechern**: klein ist gut. Ueber 0.5 kommt eine Warnung, dann wurden die Stimmen nicht getrennt.
+- **Selbstaehnlichkeit**: gross ist gut, die Datei klingt durchgehend nach derselben Person.
+
+Bleibt im Ergebnis noch die zweite Stimme hoerbar, zuerst `erosion_sec` und `min_margin` in `podcast.yml` anheben.
 
 ## XTTS / Voice Cloning
 
@@ -260,22 +402,88 @@ uv run codcast generate "Thema" \
   --speakers 2
 ```
 
-Hinweis: `--quality best` nutzt den in `tts.backend` konfigurierten Premium-Pfad, aktuell OpenAI. `--quality openai` erzwingt OpenAI, `--quality fast` nutzt Kokoro/Kikiri. `--quality xtts` bleibt fuer eigene XTTS-Referenzstimmen verfuegbar.
+Hinweis: `--quality best` nutzt den in `tts.backend` konfigurierten Pfad, standardmaessig das lokale Chatterbox. `--quality chatterbox` erzwingt den lokalen Pfad, `--quality openai` erzwingt OpenAI (kostet Geld), `--quality fast` nutzt Kokoro/Kikiri. `--quality xtts` bleibt fuer eigene XTTS-Referenzstimmen verfuegbar. Im Wizard zeigt die Zeile `Audio-Qualitaet` immer das effektive Backend, damit `best` nicht unbemerkt Geld kostet.
 
-## Codex-Verhalten
+### Gemessener Vergleich der Audiopfade
 
-Die Standard-Recherche ruft bei aktivierter Live-Suche `codex --search exec --ephemeral --output-schema ...` auf. Codex schreibt strukturierte JSON-Artefakte; `stdout` und `stderr` jedes Codex-Schritts werden im Run-Ordner gespeichert. Mit `--cached-search` wird Live-Websuche deaktiviert und Codex nutzt den konfigurierten Standard.
+Acht deutsche Saetze aus einer echten Episode, jeweils mit derselben Referenzstimme. `WER` ist die Wortfehlerrate nach Transkription mit faster-whisper large-v3 (misst Aussprachefehler), `Sprecher-Aehnlichkeit` die CAMPPlus-Cosine-Similarity gegen die Referenzaufnahme, `MOS` der SQUIM-Schaetzwert gegen das OpenAI-Original.
 
-Bei `--research-depth deep` und `--research-depth dossier` setzt die Pipeline fuer Planungs-, Extraktions- und Dossier-Schritte `model_reasoning_effort="xhigh"` und hoehere Timeouts. Diese Codex-Schritte laufen ohne Codex-Live-Suche; die Web-Datenbeschaffung laeuft ueber den lokalen Research-Provider `searxng`. Paid Drittanbieter-Suchdienste sind dafuer nicht erforderlich.
+| Pfad | WER | Sprecher-Aehnlichkeit | MOS | Kosten |
+|---|---|---|---|---|
+| OpenAI TTS (`gpt-4o-mini-tts`) | 0,072 | 0,879 | 4,59 | ca. 5 Euro pro Episode |
+| Chatterbox, Defaults dieses Projekts | **0,016** | **0,887** | 4,38 | 0 |
+| Chatterbox, lizenzfreie Referenz | 0,047 | 0,304 | 4,27 | 0 |
+| Kokoro/Kikiri (`fast`) | 0,077 | 0,429 | 4,39 | 0 |
+
+Die Sprecher-Aehnlichkeit ist nur zwischen Pfaden mit derselben Zielstimme vergleichbar: 0,879 ist der Referenzwert derselben Stimme in anderen Saetzen, die lizenzfreie Variante klingt absichtlich nach einer anderen Person. Kokoros WER liegt scheinbar gleichauf, produziert aber echte Aussprachefehler wie "Corsa-Brit" fuer "Corsa Hybrid". CosyVoice 3 (0,5B) wurde ebenfalls getestet und lieferte in diesem Setup keine brauchbare deutsche Sprache (WER 0,99, halb Stille), sowohl `inference_zero_shot` als auch `inference_cross_lingual`.
+
+## LLM-Provider
+
+Der Provider wird in `podcast.yml` unter `llm.provider` gesetzt (Standard `claude`) und pro Run mit `--llm-provider {claude,codex}` ueberschrieben. Weitere Flags: `--model` (Modell des aktiven Providers), `--effort {low,medium,high,xhigh,max}`, `--cached-search` (Live-Websuche aus). `--codex-model` bleibt als Alias fuer den Codex-Provider erhalten.
+
+Beide Provider liefern dieselben strukturierten JSON-Artefakte pro Schritt, und `stdout`/`stderr` jedes Schritts landen im Run-Ordner. Damit funktionieren `resume` und `inspect` unabhaengig vom Provider.
+
+```bash
+uv run codcast setup-claude
+uv run codcast generate "Thema" --min-minutes 10 --max-minutes 15 --speakers 2 --ui
+uv run codcast generate "Thema" --min-minutes 10 --max-minutes 15 --model fable
+uv run codcast generate "Thema" --min-minutes 10 --max-minutes 15 --llm-provider codex
+```
+
+### Modellwahl
+
+`--model` akzeptiert Kurz-Aliase, die auf feste Modell-IDs aufgeloest werden, damit ein Run reproduzierbar bleibt:
+
+| Alias | Modell-ID | Einsatz |
+| --- | --- | --- |
+| `opus` | `claude-opus-5` | Standard, gute Balance aus Qualitaet und Verbrauch |
+| `fable` | `claude-fable-5` | Anthropics faehigstes Modell, fuer besonders anspruchsvolle Themen und Tiefenrecherche. Verbraucht deutlich mehr Abo-Kontingent pro Run. |
+| `sonnet` | `claude-sonnet-5` | schneller und sparsamer, fuer einfachere Themen |
+
+Jede andere Angabe wird unveraendert an die CLI weitergegeben, z. B. `--model claude-opus-4-8`. Dauerhaft umstellen laesst sich das Modell in `podcast.yml` unter `llm.claude.model`.
+
+Im Wizard (`podcast`) ist das Punkt 7 im Menue: dort genuegt `2` oder `fable`. Die Flags in diesem Abschnitt sind nur fuer Skripte und den `generate`-Unterbefehl noetig.
+
+### Claude-Verhalten (Standard)
+
+Ein Schritt ruft `claude -p` auf, der Prompt kommt ueber `stdin` und nie via argv:
+
+```
+claude -p --model claude-opus-5 [--effort xhigh] \
+  --json-schema '<Schema inline>' \
+  --output-format stream-json --verbose \
+  --tools WebSearch            # ohne Live-Suche: --tools "" \
+  --strict-mcp-config --setting-sources "" --disable-slash-commands \
+  --no-session-persistence \
+  --system-prompt '<Extraktor-Prompt>'
+```
+
+`--json-schema` erzwingt das Ausgabeschema, das Ergebnis wird aus dem `result`-Event (`structured_output`) gelesen. `--output-format stream-json` liefert die Live-Logs fuer die TUI.
+
+Die Isolationsflags sind nicht optional: `--tools` filtert **keine** MCP-Tools, ohne `--strict-mcp-config` und `--setting-sources ""` landen global konfigurierte MCP-Server, Hooks und Skills im Recherche-Run. Der eigene `--system-prompt` ersetzt zusaetzlich den Coding-Agent-Standardprompt und senkt den Overhead pro Schritt deutlich. Zum Abschalten (nur fuer Debugging) `llm.claude.isolate: false`.
+
+Voraussetzung ist eine installierte Claude CLI mit Abo-Login (`uv run codcast setup-claude` zeigt die Schritte). Fehlt sie, bricht der Run mit einem Hinweis auf `--llm-provider codex` ab.
+
+### Codex-Verhalten
+
+Die Standard-Recherche ruft bei aktivierter Live-Suche `codex --search exec --ephemeral --output-schema ...` auf. Mit `--cached-search` wird Live-Websuche deaktiviert und Codex nutzt den konfigurierten Standard.
+
+### Reasoning bei Tiefenrecherche
+
+Bei `--research-depth deep` und `--research-depth dossier` setzt die Pipeline fuer Planungs-, Extraktions- und Dossier-Schritte die hoechste Reasoning-Stufe und hoehere Timeouts: bei Claude `--effort xhigh` (konfigurierbar ueber `llm.claude.deep_effort`), bei Codex `model_reasoning_effort="xhigh"`. Diese Schritte laufen ohne Live-Suche des LLM; die Web-Datenbeschaffung laeuft ueber den lokalen Research-Provider `searxng`. Paid Drittanbieter-Suchdienste sind dafuer nicht erforderlich.
 
 ## Nuetzliche Kommandos
 
 ```bash
 uv run codcast init-config --force
+uv run codcast setup-claude
+uv run codcast setup-chatterbox
+uv run codcast setup-diarize
 uv run codcast setup-fish
 uv run codcast voices list
-uv run codcast voices test fish-host-m
-uv run codcast voices test fish-host-f
+uv run codcast voices extract folge.mp3 --speakers 2 --minutes 5
+uv run codcast voices test chatterbox-host-m
+uv run codcast voices test chatterbox-host-f
 uv run codcast inspect <run-id>
 uv run pytest
 ```

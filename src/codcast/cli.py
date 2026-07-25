@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .audio import assemble_episode
-from .config import VoiceProfile, default_config_dict, load_config, write_config
+from .audio import assemble_episode, command_available
+from .config import AppConfig, VoiceProfile, default_config_dict, load_config, write_config
 from .models import PodcastScript
 from .pipeline import PodcastGenerator
 from .progress import PodcastCancelled
@@ -18,8 +20,49 @@ from .voices import backend_for_quality, select_voice_profiles, voice_map
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-QUALITY_CHOICES = ("best", "fast", "openai", "xtts")
+QUALITY_CHOICES = ("best", "chatterbox", "fast", "openai", "xtts")
 RESEARCH_DEPTH_CHOICES = ("standard", "deep", "dossier")
+LLM_PROVIDER_CHOICES = ("claude", "codex")
+EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+# Bewusst ungated: kein HuggingFace-Token noetig, anders als bei pyannote.
+DIARIZE_PACKAGES = ("torch", "torchaudio", "speechbrain", "silero-vad", "scikit-learn", "soundfile", "numpy<2")
+# Short aliases that resolve to pinned model IDs, so a run stays reproducible.
+CLAUDE_MODEL_ALIASES = {
+    "opus": "claude-opus-5",
+    "fable": "claude-fable-5",
+    "sonnet": "claude-sonnet-5",
+}
+EFFORT_DEFAULT_LABEL = "standard"
+
+QUALITY_DESCRIPTIONS = {
+    "best": "Premium-Pfad aus podcast.yml (tts.backend)",
+    "chatterbox": "lokal auf der GPU, klont Referenzstimmen, kostenlos",
+    "fast": "Kokoro, lokal und schnell",
+    "openai": "OpenAI TTS, kostet Geld, benoetigt OPENAI_TTS_API_KEY",
+    "xtts": "eigene XTTS-Referenzstimmen",
+}
+RESEARCH_DEPTH_DESCRIPTIONS = {
+    "standard": "eine Recherche-Runde, schnellster Weg",
+    "deep": "mehrere Runden ueber lokale SearXNG-Suche",
+    "dossier": "gruendlichste Stufe mit Dossier und Revision",
+}
+LLM_PROVIDER_DESCRIPTIONS = {
+    "claude": "Claude CLI, Abo-Login, Standard",
+    "codex": "Codex CLI, Abo-Login",
+}
+CLAUDE_MODEL_DESCRIPTIONS = {
+    "opus": "claude-opus-5, gute Balance (Standard)",
+    "fable": "claude-fable-5, faehigstes Modell, hoeherer Verbrauch",
+    "sonnet": "claude-sonnet-5, schnell und sparsam",
+}
+EFFORT_DESCRIPTIONS = {
+    EFFORT_DEFAULT_LABEL: "Vorgabe der CLI verwenden",
+    "low": "wenig Nachdenken, schnell und sparsam",
+    "medium": "ausgeglichen",
+    "high": "gruendlich",
+    "xhigh": "sehr gruendlich, empfohlen fuer schwere Themen",
+    "max": "maximal, hoechster Verbrauch",
+}
 WIZARD_DEFAULT_MIN_MINUTES = 10.0
 WIZARD_DEFAULT_MAX_MINUTES = 15.0
 
@@ -30,6 +73,84 @@ def project_root() -> Path:
 
 def add_common_config_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=Path("podcast.yml"), help="Path to podcast.yml")
+
+
+def add_llm_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--llm-provider",
+        choices=list(LLM_PROVIDER_CHOICES),
+        default=None,
+        help="LLM provider for research and scripting (default from podcast.yml: claude)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model for the active LLM provider. For claude also accepts the aliases "
+            + "/".join(CLAUDE_MODEL_ALIASES)
+            + " (resolved to pinned IDs, e.g. fable -> claude-fable-5)"
+        ),
+    )
+    parser.add_argument(
+        "--effort",
+        choices=list(EFFORT_CHOICES),
+        default=None,
+        help="Reasoning effort for the active LLM provider",
+    )
+    parser.add_argument("--codex-model", default=None, help="Deprecated alias for --model on the codex provider")
+    parser.add_argument(
+        "--cached-search",
+        action="store_true",
+        help="Disable live web search and rely on cached knowledge",
+    )
+
+
+def resolve_claude_model(value: str) -> str:
+    """Expand a short alias like 'fable' to its pinned model ID; pass anything else through."""
+    return CLAUDE_MODEL_ALIASES.get(value.strip().lower(), value)
+
+
+def claude_model_choices(current: str) -> tuple[tuple[str, ...], str]:
+    """Wizard choices for the Claude model plus the key matching the configured model."""
+    by_id = {model_id: alias for alias, model_id in CLAUDE_MODEL_ALIASES.items()}
+    choices = tuple(CLAUDE_MODEL_ALIASES)
+    if current in by_id:
+        return choices, by_id[current]
+    # A model configured by hand stays selectable instead of being silently dropped.
+    return choices + (current,), current
+
+
+def apply_llm_args(config: AppConfig, args: argparse.Namespace) -> None:
+    """Apply LLM-related CLI flags onto the loaded config."""
+    provider = getattr(args, "llm_provider", None)
+    if provider:
+        config.llm.provider = provider
+    codex_model = getattr(args, "codex_model", None)
+    if codex_model:
+        config.codex.model = codex_model
+    model = getattr(args, "model", None)
+    if model:
+        if config.llm.provider == "claude":
+            config.llm.claude.model = resolve_claude_model(model)
+        else:
+            config.codex.model = model
+    effort = getattr(args, "effort", None)
+    if effort:
+        config.llm.claude.effort = effort
+        config.codex.effort = effort
+    if getattr(args, "cached_search", False):
+        config.llm.claude.live_search = False
+        config.codex.live_search = False
+
+
+def _apply_voice_set(config: AppConfig, args: argparse.Namespace) -> None:
+    name = getattr(args, "voice_set", None)
+    if not name:
+        return
+    if name not in config.tts.voice_sets:
+        available = ", ".join(config.tts.voice_sets) or "keine"
+        raise SystemExit(f"Unbekanntes Stimmen-Set '{name}'. Verfuegbar: {available}")
+    config.tts.voice_set = name
 
 
 def print_manifest(manifest) -> None:
@@ -63,10 +184,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
     config.tts.backend = backend_for_quality(config, selected_quality)
     selected_research_depth = args.research_depth or config.research.depth
     config.research.depth = selected_research_depth
-    if args.codex_model:
-        config.codex.model = args.codex_model
-    if args.cached_search:
-        config.codex.live_search = False
+    _apply_voice_set(config, args)
+    apply_llm_args(config, args)
     generator = PodcastGenerator(config, project_root())
     generate_kwargs = {
         "topic": topic,
@@ -169,24 +288,6 @@ def _prompt_float(
         return value
 
 
-def _prompt_choice(
-    prompt: str,
-    *,
-    choices: tuple[str, ...],
-    default: str,
-    input_func: Callable[[str], str] = input,
-) -> str:
-    choice_text = "/".join(choices)
-    while True:
-        raw = input_func(f"{prompt} ({choice_text}) [{default}]: ").strip().lower()
-        if not raw:
-            return default
-        matches = [choice for choice in choices if choice.startswith(raw)]
-        if len(matches) == 1:
-            return matches[0]
-        print(f"Bitte einen dieser Werte eingeben: {choice_text}.")
-
-
 def _prompt_yes_no(
     prompt: str,
     *,
@@ -203,6 +304,40 @@ def _prompt_yes_no(
         if raw in {"n", "nein", "no"}:
             return False
         print("Bitte ja oder nein eingeben.")
+
+
+def _prompt_option(
+    prompt: str,
+    *,
+    choices: tuple[str, ...],
+    default: str,
+    descriptions: dict[str, str] | None = None,
+    input_func: Callable[[str], str] = input,
+) -> str:
+    """Show every choice as a numbered line and accept a number, a name or a prefix."""
+    print("")
+    print(f"{prompt}:")
+    width = max(len(choice) for choice in choices)
+    for index, choice in enumerate(choices, start=1):
+        marker = ">" if choice == default else " "
+        description = (descriptions or {}).get(choice, "")
+        suffix = f"  {description}" if description else ""
+        label = choice.ljust(width) if description else choice
+        print(f" {marker} {index}) {label}{suffix}")
+    while True:
+        raw = input_func(f"Auswahl [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(choices):
+                return choices[index - 1]
+            print(f"Bitte 1-{len(choices)} eingeben.")
+            continue
+        matches = [choice for choice in choices if choice.lower().startswith(raw)]
+        if len(matches) == 1:
+            return matches[0]
+        print(f"Bitte eine Nummer 1-{len(choices)} oder einen der Namen eingeben.")
 
 
 def cmd_podcast_wizard(*, input_func: Callable[[str], str] = input) -> int:
@@ -223,77 +358,295 @@ def cmd_podcast_wizard(*, input_func: Callable[[str], str] = input) -> int:
     print("Tipp: Lange Themen als @/pfad/zur/thema.txt eingeben.")
     print("")
 
-    topic = _prompt_topic(input_func=input_func)
-    speakers = _prompt_int(
+    state = _WizardState(
+        topic=_prompt_topic(input_func=input_func),
+        speakers=2,
+        min_minutes=WIZARD_DEFAULT_MIN_MINUTES,
+        max_minutes=WIZARD_DEFAULT_MAX_MINUTES,
+        quality=default_quality,
+        research_depth=default_research_depth,
+        provider=config.llm.provider,
+        claude_model=config.llm.claude.model,
+        codex_model=config.codex.model,
+        effort=config.llm.claude.effort or EFFORT_DEFAULT_LABEL,
+        live_search=config.llm.claude.live_search,
+        render_audio=True,
+        language=default_language,
+    )
+
+    if not _run_settings_menu(state, config, output_root, input_func=input_func):
+        print("Abgebrochen.")
+        return 1
+
+    config.language = state.language
+    config.tts.quality = state.quality
+    config.tts.backend = backend_for_quality(config, state.quality)
+    if state.voice_set:
+        config.tts.voice_set = state.voice_set
+    config.research.depth = state.research_depth
+    config.llm.provider = state.provider
+    config.llm.claude.model = state.claude_model
+    config.codex.model = state.codex_model
+    config.llm.claude.effort = None if state.effort == EFFORT_DEFAULT_LABEL else state.effort
+    config.codex.effort = config.llm.claude.effort
+    config.llm.claude.live_search = state.live_search
+    config.codex.live_search = state.live_search
+
+    generator = PodcastGenerator(config, PROJECT_ROOT)
+    try:
+        PodcastTui().run_generator(
+            generator,
+            topic=state.topic,
+            min_minutes=state.min_minutes,
+            max_minutes=state.max_minutes,
+            speaker_count=state.speakers,
+            quality=state.quality,
+            language=state.language,
+            research_depth=state.research_depth,
+            render_audio=state.render_audio,
+        )
+    except PodcastCancelled:
+        return 130
+    return 0
+
+
+@dataclass
+class _WizardState:
+    topic: str
+    speakers: int
+    min_minutes: float
+    max_minutes: float
+    quality: str
+    research_depth: str
+    provider: str
+    claude_model: str
+    codex_model: str | None
+    effort: str
+    live_search: bool
+    render_audio: bool
+    language: str
+    voice_set: str | None = None
+
+    @property
+    def model_label(self) -> str:
+        if self.provider == "claude":
+            return self.claude_model
+        return self.codex_model or "CLI-Default"
+
+
+def _topic_preview(topic: str, limit: int = 60) -> str:
+    single_line = " ".join(topic.split())
+    if len(single_line) <= limit:
+        return single_line
+    return f"{single_line[: limit - 1]}…"
+
+
+def _quality_label(state: _WizardState, config: AppConfig) -> str:
+    """Make clear which backend runs, so `best` cannot silently mean paid OpenAI."""
+    backend = backend_for_quality(config, state.quality)
+    suffix = " (kostet Geld)" if backend == "openai" else ""
+    if backend == state.quality:
+        return f"{state.quality}{suffix}"
+    return f"{state.quality} -> {backend}{suffix}"
+
+
+def _voice_set_label(state: _WizardState, config: AppConfig) -> str:
+    name = state.voice_set or config.tts.voice_set
+    if not name:
+        return "Standard (erste passende Stimmen)"
+    members = config.tts.voice_sets.get(name, [])
+    names = ", ".join(
+        voice.display_name for voice in config.tts.voices if voice.id in members
+    )
+    return f"{name} ({names})" if names else name
+
+
+def _edit_voice_set(state: _WizardState, config: AppConfig, input_func: Callable[[str], str]) -> None:
+    choices = tuple(config.tts.voice_sets)
+    descriptions = {
+        name: ", ".join(voice.display_name for voice in config.tts.voices if voice.id in members)
+        for name, members in config.tts.voice_sets.items()
+    }
+    state.voice_set = _prompt_option(
+        "Stimmen-Besetzung",
+        choices=choices,
+        default=state.voice_set or config.tts.voice_set or choices[0],
+        descriptions=descriptions,
+        input_func=input_func,
+    )
+
+
+def _run_settings_menu(
+    state: _WizardState,
+    config: AppConfig,
+    output_root: Path,
+    *,
+    input_func: Callable[[str], str] = input,
+) -> bool:
+    """Show every option as an editable row. Empty input starts the run."""
+    rows: list[tuple[str, Callable[[], str], Callable[[], None]]] = [
+        ("Thema", lambda: _topic_preview(state.topic), lambda: _edit_topic(state, input_func)),
+        ("Sprecher", lambda: str(state.speakers), lambda: _edit_speakers(state, config, input_func)),
+        (
+            "Laenge",
+            lambda: f"{state.min_minutes:g}-{state.max_minutes:g} Minuten",
+            lambda: _edit_length(state, input_func),
+        ),
+        ("Audio-Qualitaet", lambda: _quality_label(state, config), lambda: _edit_quality(state, input_func)),
+        ("Recherche-Tiefe", lambda: state.research_depth, lambda: _edit_depth(state, input_func)),
+        ("LLM-Provider", lambda: state.provider, lambda: _edit_provider(state, input_func)),
+        ("Modell", lambda: state.model_label, lambda: _edit_model(state, input_func)),
+        ("Reasoning-Effort", lambda: state.effort, lambda: _edit_effort(state, input_func)),
+        (
+            "Live-Websuche",
+            lambda: "ein" if state.live_search else "aus",
+            lambda: _edit_live_search(state, input_func),
+        ),
+        (
+            "Audio rendern",
+            lambda: "ja" if state.render_audio else "nein (nur Transkript)",
+            lambda: _edit_render(state, input_func),
+        ),
+        ("Sprache", lambda: state.language, lambda: _edit_language(state, input_func)),
+    ]
+    if config.tts.voice_sets:
+        rows.insert(
+            4,
+            ("Stimmen", lambda: _voice_set_label(state, config), lambda: _edit_voice_set(state, config, input_func)),
+        )
+
+    while True:
+        print("")
+        print("Einstellungen:")
+        width = max(len(label) for label, _, _ in rows)
+        for index, (label, render, _) in enumerate(rows, start=1):
+            print(f"  {index:>2}) {label.ljust(width)}  {render()}")
+        print(f"      {'Ausgabe'.ljust(width)}  {output_root}")
+        print("")
+        raw = input_func("Nummer aendern, leer = Podcast starten, q = abbrechen: ").strip().lower()
+        if not raw:
+            return True
+        if raw in {"q", "quit", "abbrechen", "n", "nein"}:
+            return False
+        if raw.isdigit() and 1 <= int(raw) <= len(rows):
+            rows[int(raw) - 1][2]()
+            continue
+        print(f"Bitte 1-{len(rows)} eingeben, leer zum Starten oder q zum Abbrechen.")
+
+
+def _edit_topic(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.topic = _prompt_topic(input_func=input_func)
+
+
+def _edit_speakers(state: _WizardState, config: AppConfig, input_func: Callable[[str], str]) -> None:
+    state.speakers = _prompt_int(
         "Sprecher",
-        default=2,
+        default=state.speakers,
         minimum=1,
         maximum=config.generation.max_speakers,
         input_func=input_func,
     )
-    min_minutes = _prompt_float(
+
+
+def _edit_length(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.min_minutes = _prompt_float(
         "Mindestlaenge in Minuten",
-        default=WIZARD_DEFAULT_MIN_MINUTES,
+        default=state.min_minutes,
         minimum=0.1,
         input_func=input_func,
     )
     while True:
         max_minutes = _prompt_float(
             "Maximallaenge in Minuten",
-            default=WIZARD_DEFAULT_MAX_MINUTES,
+            default=max(state.max_minutes, state.min_minutes),
             minimum=0.1,
             input_func=input_func,
         )
-        if max_minutes >= min_minutes:
-            break
+        if max_minutes >= state.min_minutes:
+            state.max_minutes = max_minutes
+            return
         print("Die Maximallaenge muss groesser oder gleich der Mindestlaenge sein.")
-    quality = _prompt_choice(
-        "Qualitaet",
+
+
+def _edit_quality(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.quality = _prompt_option(
+        "Audio-Qualitaet",
         choices=QUALITY_CHOICES,
-        default=default_quality,
+        default=state.quality,
+        descriptions=QUALITY_DESCRIPTIONS,
         input_func=input_func,
     )
-    research_depth = _prompt_choice(
+
+
+def _edit_depth(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.research_depth = _prompt_option(
         "Recherche-Tiefe",
         choices=RESEARCH_DEPTH_CHOICES,
-        default=default_research_depth,
+        default=state.research_depth,
+        descriptions=RESEARCH_DEPTH_DESCRIPTIONS,
         input_func=input_func,
     )
-    language = input_func(f"Sprache [{default_language}]: ").strip() or default_language
 
-    print("")
-    print("Zusammenfassung:")
-    print(f"Thema: {topic}")
-    print(f"Sprecher: {speakers}")
-    print(f"Laenge: {min_minutes:g}-{max_minutes:g} Minuten")
-    print(f"Qualitaet: {quality}")
-    print(f"Recherche-Tiefe: {research_depth}")
-    print(f"Sprache: {language}")
-    print(f"Ausgabe: {output_root}")
-    if not _prompt_yes_no("Podcast jetzt starten?", default=True, input_func=input_func):
-        print("Abgebrochen.")
-        return 1
 
-    config.language = language
-    config.tts.quality = quality
-    config.tts.backend = backend_for_quality(config, quality)
-    config.research.depth = research_depth
-    generator = PodcastGenerator(config, PROJECT_ROOT)
-    try:
-        PodcastTui().run_generator(
-            generator,
-            topic=topic,
-            min_minutes=min_minutes,
-            max_minutes=max_minutes,
-            speaker_count=speakers,
-            quality=quality,
-            language=language,
-            research_depth=research_depth,
-            render_audio=True,
+def _edit_provider(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.provider = _prompt_option(
+        "LLM-Provider",
+        choices=LLM_PROVIDER_CHOICES,
+        default=state.provider,
+        descriptions=LLM_PROVIDER_DESCRIPTIONS,
+        input_func=input_func,
+    )
+
+
+def _edit_model(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    if state.provider == "claude":
+        choices, default = claude_model_choices(state.claude_model)
+        state.claude_model = resolve_claude_model(
+            _prompt_option(
+                "Claude-Modell",
+                choices=choices,
+                default=default,
+                descriptions=CLAUDE_MODEL_DESCRIPTIONS,
+                input_func=input_func,
+            )
         )
-    except PodcastCancelled:
-        return 130
-    return 0
+        return
+    current = state.codex_model or "CLI-Default"
+    raw = input_func(f"Codex-Modell (leer = unveraendert, '-' = CLI-Default) [{current}]: ").strip()
+    if raw == "-":
+        state.codex_model = None
+    elif raw:
+        state.codex_model = raw
+
+
+def _edit_effort(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.effort = _prompt_option(
+        "Reasoning-Effort",
+        choices=(EFFORT_DEFAULT_LABEL,) + EFFORT_CHOICES,
+        default=state.effort,
+        descriptions=EFFORT_DESCRIPTIONS,
+        input_func=input_func,
+    )
+
+
+def _edit_live_search(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.live_search = _prompt_yes_no(
+        "Live-Websuche des LLM nutzen?",
+        default=state.live_search,
+        input_func=input_func,
+    )
+
+
+def _edit_render(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.render_audio = _prompt_yes_no(
+        "Audio rendern? (nein = nur Transkript und Quellen)",
+        default=state.render_audio,
+        input_func=input_func,
+    )
+
+
+def _edit_language(state: _WizardState, input_func: Callable[[str], str]) -> None:
+    state.language = input_func(f"Sprache [{state.language}]: ").strip() or state.language
 
 
 def cmd_init_config(args: argparse.Namespace) -> int:
@@ -343,6 +696,8 @@ def cmd_voices_import(args: argparse.Namespace) -> int:
     voice_id = args.name.strip().lower().replace(" ", "-")
     if not voice_id:
         raise SystemExit("Voice name cannot be empty")
+    if args.backend != "chatterbox" and not args.transcript:
+        raise SystemExit(f"--transcript is required for the {args.backend} backend")
     existing = next((voice for voice in config.tts.voices if voice.id == voice_id), None)
     source_wav = args.wav.expanduser().resolve()
     if not source_wav.exists():
@@ -364,6 +719,46 @@ def cmd_voices_import(args: argparse.Namespace) -> int:
     config.tts.voices = [voice for voice in config.tts.voices if voice.id != voice_id] + [profile]
     write_config(config, config_path)
     print(f"Imported {args.backend} voice {voice_id} into {dest}")
+    return 0
+
+
+def cmd_voices_extract(args: argparse.Namespace) -> int:
+    from .diarize import extract_voices
+
+    config = load_config(args.config)
+    out_dir = args.out or Path("voices/source_candidates") / args.source.stem
+    report = extract_voices(
+        config,
+        args.source,
+        out_dir,
+        speakers=args.speakers,
+        minutes=args.minutes,
+        device=args.device,
+        skip_head=args.skip_head,
+        skip_tail=args.skip_tail,
+    )
+
+    between = report["verification"]["between_speakers"]
+    cross = max(
+        between[i][j] for i in range(len(between)) for j in range(len(between)) if i != j
+    )
+    print()
+    print(f"Bericht: {out_dir / 'report.json'}")
+    for detail, within in zip(report["speakers_detail"], report["verification"]["within_speaker"]):
+        print(
+            f"  {detail['label']}: {detail['seconds']:.0f}s aus {detail['chunk_count']} Chunks, "
+            f"Margin {detail['margin_mean']:.3f}, "
+            f"Selbstaehnlichkeit {within['mean']:.3f} (min {within['min']:.3f})"
+        )
+        print(f"    {detail['export_wav']}")
+    # Der Wert entscheidet, ob das Material taugt: hoch heisst, die beiden
+    # Ergebnisdateien klingen nach derselben Person.
+    print(f"  Aehnlichkeit zwischen den Sprechern: {cross:.3f} (klein ist gut)")
+    if cross > 0.5:
+        print("  WARNUNG: Die Sprecher wurden nicht sauber getrennt. Ergebnis vor Gebrauch pruefen.")
+    print("  Previews anhoeren, dann z.B.:")
+    first = report["speakers_detail"][0]
+    print(f"    uv run codcast voices import --backend chatterbox --name meine-stimme --wav {first['export_wav']}")
     return 0
 
 
@@ -414,6 +809,7 @@ def cmd_rerender(args: argparse.Namespace) -> int:
     selected_quality = args.quality or config.tts.quality
     config.tts.quality = selected_quality
     config.tts.backend = backend_for_quality(config, selected_quality)
+    _apply_voice_set(config, args)
 
     run_dir = resolve_run_dir(args.run, config)
     script_path = run_dir / "script.json"
@@ -498,6 +894,113 @@ def cmd_setup_fish(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup_claude(_: argparse.Namespace) -> int:
+    print("Claude als LLM-Provider (Standard):")
+    print("  1. Claude CLI installieren: https://claude.com/product/claude-code")
+    print("  2. Einmal 'claude' starten und mit dem Abo einloggen.")
+    print("     Es wird KEIN API-Key benoetigt, dieses Projekt speichert auch keinen.")
+    print("  3. Pruefen: claude --version")
+    print("  4. Nutzung (Claude ist der Default):")
+    print("     uv run codcast generate \"Thema\" --min-minutes 10 --max-minutes 15 --speakers 2 --ui")
+    print("  5. Modell/Effort anpassen: --model claude-opus-5 --effort xhigh")
+    print("  6. Auf den alten Provider ausweichen: --llm-provider codex")
+    return 0
+
+
+def cmd_setup_chatterbox(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    python_executable = config.tts.chatterbox.python_executable
+    if not python_executable.is_absolute():
+        python_executable = project_root() / python_executable
+    venv_dir = python_executable.parent.parent
+
+    print("Chatterbox Multilingual (lokal, MIT-Lizenz, klont Referenzstimmen)")
+    print(f"  venv: {venv_dir}")
+    if not command_available("uv"):
+        print("  uv wurde nicht gefunden. Installiere uv oder lege die venv manuell an:")
+        print(f"    python3.12 -m venv {venv_dir}")
+        print(f"    {venv_dir}/bin/pip install chatterbox-tts 'setuptools<81'")
+        return 1
+
+    steps = [
+        (["uv", "venv", "--python", "3.12", str(venv_dir)], "venv anlegen"),
+        # setuptools<81 wird gebraucht, weil resemble-perth (Wasserzeichen) pkg_resources importiert.
+        (["uv", "pip", "install", "--python", str(python_executable), "chatterbox-tts", "setuptools<81"], "Pakete installieren"),
+    ]
+    for command, label in steps:
+        print(f"  {label}: {' '.join(command)}")
+        result = subprocess.run(command, cwd=project_root())
+        if result.returncode != 0:
+            print(f"  Abbruch: {label} ist fehlgeschlagen.")
+            return result.returncode
+
+    check = subprocess.run(
+        [str(python_executable), "-c", "import perth, chatterbox.mtl_tts; assert perth.PerthImplicitWatermarker; print('ok')"],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        print("  Installationspruefung fehlgeschlagen:")
+        print(check.stderr.strip()[-800:])
+        return check.returncode
+
+    print("  Pruefung: ok")
+    print("  Modellgewichte (ca. 3 GB) laedt der erste Lauf automatisch nach ~/.cache/huggingface.")
+    print("  Zwei Referenzstimmen importieren (10 Sekunden sauberes Deutsch reichen):")
+    print("     uv run codcast voices import --backend chatterbox --name chatterbox-host-m --wav /pfad/maennlich.wav")
+    print("     uv run codcast voices import --backend chatterbox --name chatterbox-host-f --wav /pfad/weiblich.wav")
+    print("  Danach: uv run codcast voices test chatterbox-host-m")
+    return 0
+
+
+def cmd_setup_diarize(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    python_executable = config.diarize.python_executable
+    if not python_executable.is_absolute():
+        python_executable = project_root() / python_executable
+    venv_dir = python_executable.parent.parent
+
+    print("Sprechertrennung fuer `voices extract` (lokal, ungated, kein HF-Token noetig)")
+    print(f"  venv: {venv_dir}")
+    if not command_available("uv"):
+        print("  uv wurde nicht gefunden. Installiere uv oder lege die venv manuell an:")
+        print(f"    python3.12 -m venv {venv_dir}")
+        print(f"    {venv_dir}/bin/pip install {' '.join(DIARIZE_PACKAGES)}")
+        return 1
+
+    steps = [
+        (["uv", "venv", "--python", "3.12", str(venv_dir)], "venv anlegen"),
+        (["uv", "pip", "install", "--python", str(python_executable), *DIARIZE_PACKAGES], "Pakete installieren"),
+    ]
+    for command, label in steps:
+        print(f"  {label}: {' '.join(command)}")
+        result = subprocess.run(command, cwd=project_root())
+        if result.returncode != 0:
+            print(f"  Abbruch: {label} ist fehlgeschlagen.")
+            return result.returncode
+
+    check = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            "import torch, sklearn, soundfile; from silero_vad import load_silero_vad; "
+            "from speechbrain.inference.speaker import EncoderClassifier; print('ok')",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        print("  Installationspruefung fehlgeschlagen:")
+        print(check.stderr.strip()[-800:])
+        return check.returncode
+
+    print("  Pruefung: ok")
+    print("  ECAPA-Gewichte (ca. 80 MB) laedt der erste Lauf nach models/spkrec-ecapa-voxceleb.")
+    print("  Fuenf Minuten pro Sprecher aus einer Zwei-Sprecher-Aufnahme ziehen:")
+    print("     uv run codcast voices extract /pfad/folge.mp3 --speakers 2 --minutes 5")
+    return 0
+
+
 def cmd_setup_openai(_: argparse.Namespace) -> int:
     print("OpenAI TTS setup:")
     print("  1. Lege den Key in die lokale, gitignorierte Datei:")
@@ -511,7 +1014,10 @@ def cmd_setup_openai(_: argparse.Namespace) -> int:
 
 
 def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog, description="Generate researched podcasts with Codex CLI and local TTS.")
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Generate researched podcasts with the Claude or Codex CLI and local TTS.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     generate = sub.add_parser("generate", help="Research and generate a podcast episode")
@@ -522,10 +1028,10 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     generate.add_argument("--max-minutes", type=float, required=True)
     generate.add_argument("--speakers", type=int, default=2)
     generate.add_argument("--quality", choices=list(QUALITY_CHOICES), default=None)
+    generate.add_argument("--voice-set", default=None, help="Named voice set from podcast.yml (tts.voice_sets)")
     generate.add_argument("--research-depth", choices=list(RESEARCH_DEPTH_CHOICES), default=None)
     generate.add_argument("--language", default="de-DE")
-    generate.add_argument("--codex-model", default=None)
-    generate.add_argument("--cached-search", action="store_true", help="Use Codex cached search instead of live --search")
+    add_llm_args(generate)
     generate.add_argument("--no-render", action="store_true", help="Stop after transcript and sources")
     generate.add_argument("--ui", action="store_true", help="Show a live terminal UI while generating")
     generate.set_defaults(func=cmd_generate)
@@ -557,19 +1063,40 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
 
     voices_import = voice_sub.add_parser("import")
     add_common_config_arg(voices_import)
-    voices_import.add_argument("--backend", choices=["fish", "xtts"], default="fish")
+    voices_import.add_argument("--backend", choices=["chatterbox", "fish", "xtts"], default="chatterbox")
     voices_import.add_argument("--name", required=True)
     voices_import.add_argument("--wav", type=Path, required=True)
-    voices_import.add_argument("--transcript", required=True)
+    voices_import.add_argument(
+        "--transcript",
+        default=None,
+        help="Exakt gesprochener Referenztext, erforderlich fuer fish und xtts; Chatterbox braucht keinen",
+    )
     voices_import.add_argument("--display-name", default=None)
     voices_import.add_argument("--language", default="de-DE")
     voices_import.add_argument("--license", default="personal")
     voices_import.set_defaults(func=cmd_voices_import)
 
+    voices_extract = voice_sub.add_parser(
+        "extract",
+        help="Sprecher aus einer Aufnahme trennen und pro Person sauberes Referenzmaterial schneiden",
+    )
+    add_common_config_arg(voices_extract)
+    voices_extract.add_argument("source", type=Path, help="Quelldatei (mp3, wav, m4a, ...)")
+    voices_extract.add_argument("--speakers", type=int, default=2)
+    voices_extract.add_argument("--minutes", type=float, default=5.0, help="Zielmaterial pro Sprecher")
+    voices_extract.add_argument("--out", type=Path, default=None)
+    voices_extract.add_argument("--device", default=None, help="cuda oder cpu; Default aus podcast.yml")
+    voices_extract.add_argument(
+        "--skip-head", type=float, default=0.0, help="Sekunden am Anfang ignorieren (Jingle)"
+    )
+    voices_extract.add_argument("--skip-tail", type=float, default=0.0, help="Sekunden am Ende ignorieren")
+    voices_extract.set_defaults(func=cmd_voices_extract)
+
     rerender = sub.add_parser("rerender", help="Render audio again from an existing script.json without research")
     add_common_config_arg(rerender)
     rerender.add_argument("run", type=Path)
     rerender.add_argument("--quality", choices=list(QUALITY_CHOICES), default=None)
+    rerender.add_argument("--voice-set", default=None, help="Named voice set from podcast.yml (tts.voice_sets)")
     rerender.add_argument("--suffix", default="openai-tts")
     rerender.set_defaults(func=cmd_rerender)
 
@@ -581,11 +1108,22 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     setup = sub.add_parser("setup-xtts", help="Print XTTS setup commands")
     setup.set_defaults(func=cmd_setup_xtts)
 
+    setup_chatterbox = sub.add_parser("setup-chatterbox", help="Install the local Chatterbox voice environment")
+    add_common_config_arg(setup_chatterbox)
+    setup_chatterbox.set_defaults(func=cmd_setup_chatterbox)
+
+    setup_diarize = sub.add_parser("setup-diarize", help="Install the local speaker-separation environment")
+    add_common_config_arg(setup_diarize)
+    setup_diarize.set_defaults(func=cmd_setup_diarize)
+
     setup_fish = sub.add_parser("setup-fish", help="Print Fish S2 Pro premium setup commands")
     setup_fish.set_defaults(func=cmd_setup_fish)
 
     setup_openai = sub.add_parser("setup-openai", help="Print OpenAI TTS setup commands")
     setup_openai.set_defaults(func=cmd_setup_openai)
+
+    setup_claude = sub.add_parser("setup-claude", help="Print Claude LLM provider setup steps")
+    setup_claude.set_defaults(func=cmd_setup_claude)
     return parser
 
 

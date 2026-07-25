@@ -1,8 +1,29 @@
 language: de-DE
 output_root: podcasts
+llm:
+  # Aktiver LLM-Provider fuer Recherche, Validierung und Skript: claude oder codex.
+  provider: claude
+  claude:
+    executable: claude
+    # claude-opus-5 (Standard), claude-fable-5 (faehigstes Modell, hoeherer Verbrauch)
+    # oder claude-sonnet-5 (schneller/sparsamer). CLI: --model opus|fable|sonnet
+    model: claude-opus-5
+    # effort: null nutzt den CLI-Standard; deep_effort gilt fuer deep/dossier.
+    effort: null
+    deep_effort: xhigh
+    live_search: true
+    timeout_sec: 1200
+    # isolate haelt global konfigurierte MCP-Server, Hooks und Skills aus dem Run heraus.
+    isolate: true
+    system_prompt: 'Du bist ein praeziser Recherche- und Redaktionsassistent fuer deutschsprachige
+      Podcast-Produktion. Arbeite ausschliesslich mit belegbaren Fakten und kennzeichne Unsicherheiten
+      explizit. Gib das Ergebnis ausschliesslich ueber das StructuredOutput-Tool im vorgegebenen Schema
+      zurueck: keine Vorrede, keine Nachbemerkung, keine Markdown-Codebloecke.'
+    extra_args: []
 codex:
   executable: codex
   model: null
+  effort: null
   live_search: true
   sandbox: read-only
   approval_policy: never
@@ -51,11 +72,68 @@ audio:
   channels: 1
   wav_loudnorm: true
   mp3_bitrate: 192k
+diarize:
+  # Sprechertrennung fuer `codcast voices extract`: schneidet aus einer Aufnahme
+  # mit mehreren Sprechern pro Person sauberes Referenzmaterial zum Klonen.
+  # Eigene venv, angelegt von `codcast setup-diarize`.
+  python_executable: .venv-diarize/bin/python
+  device: cuda
+  # Ungated, anders als pyannote: kein HuggingFace-Token noetig.
+  embedding_model: speechbrain/spkrec-ecapa-voxceleb
+  model_dir: models/spkrec-ecapa-voxceleb
+  window_sec: 1.5
+  hop_sec: 0.75
+  # An jedem Sprecherwechsel sitzt die Ueberlappung. Beide Enden jedes Laufs
+  # fallen weg; hoeher stellen, wenn im Ergebnis noch die zweite Stimme auftaucht.
+  erosion_sec: 0.75
+  min_run_sec: 3.0
+  min_chunk_sec: 4.0
+  max_chunk_sec: 12.0
+  # Anteil echter Sprache im Chunk, gegen Dead Air.
+  min_speech_ratio: 0.75
+  # Abstand zum eigenen minus zum fremden Sprecherzentroid. Ueberlappende Rede,
+  # Musikbett und Stoergeraeusche fallen hier durch, ohne eigenen Detektor.
+  min_margin: 0.1
+  max_peak: 0.99
+  min_rms_dbfs: -40.0
+  max_rms_dbfs: -6.0
+  # Auswahl ueber die Laufzeit verteilen statt nur die beste Passage nehmen.
+  time_bins: 10
+  analysis_sample_rate: 16000
+  master_sample_rate: 44100
+  export_sample_rate: 24000
+  max_gap_sec: 1.0
+  loudnorm_i: -20.0
+  loudnorm_tp: -1.5
+  gap_between_chunks_sec: 0.15
+  preview_sec: 30.0
+  timeout_sec: 7200
 tts:
   quality: best
-  backend: openai
+  # chatterbox laeuft lokal auf der GPU und kostet nichts pro Episode.
+  # openai bleibt waehlbar (--quality openai), kostet aber pro Episode Geld.
+  backend: chatterbox
   language: de
   allow_voice_reuse: false
+  chatterbox:
+    # Eigene venv, angelegt von `codcast setup-chatterbox`.
+    python_executable: .venv-chatterbox/bin/python
+    device: cuda
+    language: de
+    # Auf Deutsch gemessene beste Kombination: ruhig, Tempo nahe der Referenz.
+    exaggeration: 0.35
+    cfg_weight: 0.3
+    temperature: 0.6
+    repetition_penalty: 2.0
+    # Schreibt Zahlen und Kuerzel aus; ohne das wird "48-Volt" zu "88 Volt".
+    normalize_text: true
+    # Wiederholungs-Loops und Abbrueche an der Segmentdauer erkennen und neu rendern.
+    max_retries: 2
+    min_duration_ratio: 0.45
+    max_duration_ratio: 1.7
+    chars_per_second: 15.0
+    startup_timeout_sec: 600
+    timeout_sec: 300
   openai:
     env_file: .env.tts.local
     api_key_env: OPENAI_TTS_API_KEY
@@ -92,7 +170,31 @@ tts:
     seed: null
     timeout_sec: 600
     use_memory_cache: 'on'
+  # Benannte Besetzungen, damit bei mehreren Stimmpaaren klar ist, wer spricht.
+  # Ohne voice_set gewinnen die ersten passenden Profile.
+  voice_set: null
+  voice_sets: {}
   voices:
+  # Referenzaufnahmen: 8 bis 15 Sekunden sauber gesprochenes Deutsch.
+  # Import mit `codcast voices import --backend chatterbox --name ... --wav ...`.
+  - id: chatterbox-host-m
+    display_name: Jonas
+    backend: chatterbox
+    language: de-DE
+    license: private
+    speaker_wav: voices/chatterbox/host-m.wav
+    speed: 1.0
+  - id: chatterbox-host-f
+    display_name: Mara
+    backend: chatterbox
+    language: de-DE
+    license: private
+    speaker_wav: voices/chatterbox/host-f.wav
+    # Einzelne Stimme nachschaerfen, ohne die anderen zu aendern.
+    # Nicht gesetzte Werte kommen aus tts.chatterbox.
+    # chatterbox_temperature: 0.45
+    # chatterbox_cfg_weight: 0.4
+    speed: 1.0
   - id: openai-cedar
     display_name: Cedar
     backend: openai

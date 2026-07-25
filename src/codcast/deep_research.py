@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 
-from .codex_runner import CodexRunner
+from .llm import LLMRunner
 from .config import AppConfig
 from .local_evidence import LocalEvidenceCollector, normalize_youtube_url
 from .models import (
@@ -278,7 +278,7 @@ class DeepResearchEngine:
     def __init__(
         self,
         config: AppConfig,
-        runner: CodexRunner,
+        runner: LLMRunner,
         project_root: Path,
         provider: ResearchProvider | None = None,
     ) -> None:
@@ -555,8 +555,8 @@ class DeepResearchEngine:
             model=DeepResearchPlan,
             progress=progress,
             cancellation=cancellation,
-            timeout_sec=self._codex_timeout(),
-            config_overrides=self._codex_overrides(),
+            timeout_sec=self._llm_timeout(),
+            reasoning=self._reasoning(),
             live_search=False,
         )
         report_progress(progress, ProgressEvent("done", "research", f"Rechercheplan mit {len(plan.seed_queries)} Queries erstellt"))
@@ -798,8 +798,8 @@ class DeepResearchEngine:
                 model=EvidenceBatch,
                 progress=progress,
                 cancellation=cancellation,
-                timeout_sec=self._codex_timeout(),
-                config_overrides=self._codex_overrides(),
+                timeout_sec=self._llm_timeout(),
+                reasoning=self._reasoning(),
                 live_search=False,
             )
             batches.append(batch)
@@ -829,8 +829,8 @@ class DeepResearchEngine:
             model=ResearchDossier,
             progress=progress,
             cancellation=cancellation,
-            timeout_sec=self._codex_timeout(),
-            config_overrides=self._codex_overrides(),
+            timeout_sec=self._llm_timeout(),
+            reasoning=self._reasoning(),
             live_search=False,
         )
         write_json(run_dir / "research_dossier.json", dossier.model_dump(mode="json"))
@@ -993,13 +993,13 @@ class DeepResearchEngine:
         max_documents = self.config.research.max_documents or defaults[2]
         return ResearchLimits(max_seconds=max_minutes * 60.0, max_rounds=max_rounds, max_documents=max_documents)
 
-    def _codex_timeout(self) -> int:
+    def _llm_timeout(self) -> int:
         minimum = 3600 if self.config.research.depth == "dossier" else 2400
         budget_seconds = int(self._limits().max_seconds)
-        return max(60, min(max(self.config.codex.timeout_sec, minimum), budget_seconds))
+        return max(60, min(max(self.config.llm_timeout_sec, minimum), budget_seconds))
 
-    def _codex_overrides(self) -> dict[str, object]:
-        return {"model_reasoning_effort": "xhigh"}
+    def _reasoning(self) -> str:
+        return self.config.llm_deep_reasoning
 
     def _has_low_source_diversity(self, documents: list[DeepResearchDocument]) -> bool:
         if len(documents) < 10:
