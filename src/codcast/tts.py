@@ -5,6 +5,7 @@ import builtins
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -12,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -362,6 +364,58 @@ class OpenAIBackend(TTSBackend):
                 f"Set {openai_config.api_key_env}=... in {openai_config.env_file}."
             )
 
+        attempt_path = output_path.with_suffix(".openai-attempt.json")
+        try:
+            with attempt_path.open("x", encoding="utf-8") as attempt_file:
+                json.dump(
+                    {
+                        "state": "started",
+                        "audio_path": str(output_path),
+                        "model": openai_config.model,
+                        "voice": voice.openai_voice or openai_config.voice,
+                        "text": text,
+                    },
+                    attempt_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except FileExistsError as exc:
+            raise RuntimeError(
+                "Kostenpflichtiger OpenAI-TTS-Aufruf blockiert: Fuer dieses Segment "
+                f"wurde bereits ein Versuch registriert ({attempt_path}). Erst den "
+                "vorherigen Versuch analysieren; keine automatische Neugenerierung."
+            ) from exc
+
+        self._render_once(requests, api_key, text, voice, output_path)
+        if not openai_config.verify_transcript:
+            _update_openai_attempt_state(attempt_path, "completed-unverified")
+            return
+        transcript = self._transcribe(requests, api_key, output_path)
+        problem = _openai_transcript_problem(text, transcript, openai_config)
+        if problem is None:
+            _update_openai_attempt_state(attempt_path, "verified")
+            return
+        report_path = output_path.with_suffix(".verification-failed.json")
+        report_path.write_text(
+            json.dumps(
+                {
+                    "problem": problem,
+                    "expected_text": text,
+                    "transcript": transcript,
+                    "audio_path": str(output_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "OpenAI TTS-Segment ist inhaltlich unvollstaendig; kein Retry. "
+            f"{problem}. Audio und Analyse: {output_path}, {report_path}"
+        )
+
+    def _render_once(self, requests, api_key: str, text: str, voice: VoiceProfile, output_path: Path) -> None:
+        openai_config = self.config.tts.openai
         payload = {
             "model": openai_config.model,
             "voice": voice.openai_voice or openai_config.voice,
@@ -384,6 +438,28 @@ class OpenAIBackend(TTSBackend):
             response.close()
             raise RuntimeError(f"OpenAI TTS request failed with HTTP {response.status_code}: {detail}")
         _write_bounded_response(response, output_path, max_bytes=openai_config.max_output_bytes, label="OpenAI TTS")
+
+    def _transcribe(self, requests, api_key: str, audio_path: Path) -> str:
+        openai_config = self.config.tts.openai
+        with audio_path.open("rb") as audio:
+            response = requests.post(
+                f"{openai_config.base_url.rstrip('/')}/audio/transcriptions",
+                data={"model": openai_config.verification_model, "language": "de"},
+                files={"file": (audio_path.name, audio, "audio/wav")},
+                headers={"authorization": f"Bearer {api_key}"},
+                timeout=openai_config.timeout_sec,
+            )
+        if response.status_code != 200:
+            detail = response.text[:1000]
+            response.close()
+            raise RuntimeError(f"OpenAI transcription verification failed with HTTP {response.status_code}: {detail}")
+        try:
+            transcript = response.json().get("text", "")
+        finally:
+            response.close()
+        if not isinstance(transcript, str) or not transcript.strip():
+            raise RuntimeError("OpenAI transcription verification returned no text")
+        return transcript
 
 
 class FishBackend(TTSBackend):
@@ -711,7 +787,6 @@ class ScriptRenderer:
         """
         pending = item.wav_path.with_name(f"{item.wav_path.stem}.part.wav")
         fingerprint_path = self._fingerprint_path(item)
-        fingerprint_path.unlink(missing_ok=True)
         self._backend(item.voice).render(item.chunk.text, item.voice, pending)
         fingerprint_path.write_text(
             json.dumps(self._segment_fingerprint(item), ensure_ascii=False, sort_keys=True),
@@ -952,6 +1027,43 @@ def _strip_env_value(value: str) -> str:
     if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
         return stripped[1:-1]
     return stripped
+
+
+def _verification_words(text: str) -> list[str]:
+    return re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", text.casefold())
+
+
+def _update_openai_attempt_state(path: Path, state: str) -> None:
+    """Best-effort status update; the exclusive marker itself is the cost guard."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["state"] = state
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _openai_transcript_problem(text: str, transcript: str, config) -> str | None:
+    """Detect silent omissions while tolerating ordinary ASR spelling errors."""
+    expected = _verification_words(text)
+    heard = _verification_words(transcript)
+    if not expected or not heard:
+        return "kein vergleichbarer Text"
+    matcher = SequenceMatcher(a=expected, b=heard, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    coverage = matched / len(expected)
+    longest_deleted = max(
+        (i2 - i1 for tag, i1, i2, _j1, _j2 in matcher.get_opcodes() if tag == "delete"),
+        default=0,
+    )
+    if len(expected) >= 20 and coverage < config.verification_min_coverage:
+        return f"nur {coverage:.1%} Wortabdeckung"
+    if longest_deleted > config.verification_max_unmatched_words:
+        return f"{longest_deleted} zusammenhaengende Woerter fehlen"
+    return None
 
 
 def _load_kokoro_model(kmodel_cls, config_path: Path, model_path: Path):

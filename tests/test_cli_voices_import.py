@@ -41,7 +41,10 @@ def test_chatterbox_import_needs_no_transcript(monkeypatch, tmp_path: Path):
     voice = next(v for v in load_config(config_path).tts.voices if v.id == "host-m")
     assert voice.backend == "chatterbox"
     assert voice.ref_text is None
-    assert voice.speaker_wav == Path("voices/host-m/ref.wav")
+    # In der YAML steht der Pfad relativ, geladen wird er gegen die Konfiguration
+    # aufgeloest.
+    assert "speaker_wav: voices/host-m/ref.wav" in config_path.read_text(encoding="utf-8")
+    assert voice.speaker_wav == tmp_path / "voices/host-m/ref.wav"
 
 
 def test_fish_import_still_requires_a_transcript(monkeypatch, tmp_path: Path):

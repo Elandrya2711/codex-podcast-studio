@@ -30,6 +30,44 @@ def test_load_config_merges_overrides(tmp_path: Path):
     assert config.tts.voices
 
 
+def test_voice_paths_are_resolved_against_the_config_file(tmp_path: Path):
+    # Sonst faellt ein Lauf aus einem fremden Arbeitsverzeichnis erst in der
+    # TTS-Stufe um, also nach der kompletten Recherche.
+    path = tmp_path / "podcast.yml"
+    path.write_text("language: de-DE\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    chatterbox = [voice for voice in config.tts.voices if voice.backend == "chatterbox"]
+    assert chatterbox
+    for voice in chatterbox:
+        assert voice.speaker_wav is not None
+        assert voice.speaker_wav.is_absolute()
+        assert voice.speaker_wav.is_relative_to(tmp_path)
+    kokoro = [voice for voice in config.tts.voices if voice.kokoro_voice is not None]
+    assert kokoro
+    for voice in kokoro:
+        assert voice.kokoro_voice.is_absolute()
+
+
+def test_absolute_voice_paths_stay_untouched(tmp_path: Path):
+    path = tmp_path / "podcast.yml"
+    path.write_text(
+        "tts:\n"
+        "  voices:\n"
+        "    - id: extern\n"
+        "      display_name: Extern\n"
+        "      backend: chatterbox\n"
+        "      speaker_wav: /srv/stimmen/host.wav\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    extern = next(voice for voice in config.tts.voices if voice.id == "extern")
+    assert extern.speaker_wav == Path("/srv/stimmen/host.wav")
+
+
 def test_legacy_tavily_research_config_is_migrated(tmp_path: Path):
     path = tmp_path / "podcast.yml"
     path.write_text(

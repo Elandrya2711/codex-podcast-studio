@@ -3,7 +3,7 @@ import threading
 from codcast.config import load_config
 from codcast.models import PodcastScript, ScriptLine, SpeakerSpec
 from codcast.tts import _api_key_from_env_or_file, _convert_kokoro_state_dict, _is_expected_missing_norm_key, fish_payload_for_voice
-from codcast.tts import OpenAIBackend, group_single_speaker_openai_lines
+from codcast.tts import OpenAIBackend, _openai_transcript_problem, group_single_speaker_openai_lines
 from codcast.tts import ScriptRenderer
 
 
@@ -150,6 +150,95 @@ def test_openai_backend_rejects_oversized_speech_response(tmp_path, monkeypatch)
 
     assert not output.exists()
     assert not (tmp_path / "out.wav.tmp").exists()
+
+
+def test_openai_transcript_verification_detects_dropped_words(tmp_path):
+    config = load_config(tmp_path / "missing.yml").tts.openai
+    source = "Als die Verfassung in Kraft trat, hofften die Freiheitskaempfer, ihre Plaene umzusetzen."
+    incomplete = "Als die Verfassung in Kraft trat, ihre Plaene umzusetzen."
+
+    problem = _openai_transcript_problem(source, incomplete, config)
+
+    assert problem is not None
+
+
+def test_openai_transcript_verification_tolerates_single_name_error(tmp_path):
+    config = load_config(tmp_path / "missing.yml").tts.openai
+
+    problem = _openai_transcript_problem(
+        "Praesident Paets setzte die Befugnisse ein.",
+        "Praesident Petz setzte die Befugnisse ein.",
+        config,
+    )
+
+    assert problem is None
+
+
+def test_openai_backend_stops_after_first_incomplete_segment_and_keeps_diagnostics(tmp_path, monkeypatch):
+    class SpeechResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def iter_content(self, chunk_size):
+            yield b"defective-wav"
+
+        def close(self):
+            pass
+
+    class TranscriptResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"text": "Eins zwei sieben acht."}
+
+        def close(self):
+            pass
+
+    speech_calls = 0
+
+    def fake_post(url, **kwargs):
+        nonlocal speech_calls
+        if url.endswith("/audio/speech"):
+            speech_calls += 1
+            return SpeechResponse()
+        return TranscriptResponse()
+
+    config = load_config(tmp_path / "missing.yml")
+    config.tts.openai.verify_transcript = True
+    config.tts.openai.env_file = tmp_path / ".env.tts.local"
+    config.tts.openai.env_file.write_text("OPENAI_TTS_API_KEY=fake-key\n", encoding="utf-8")
+    voice = next(item for item in config.tts.voices if item.backend == "openai")
+    monkeypatch.setattr("requests.post", fake_post)
+    output = tmp_path / "segment.part.wav"
+
+    try:
+        OpenAIBackend(config).render(
+            "Eins zwei drei vier fuenf sechs sieben acht.", voice, output
+        )
+    except RuntimeError as exc:
+        assert "kein Retry" in str(exc)
+    else:
+        raise AssertionError("expected incomplete TTS segment to fail")
+
+    report = tmp_path / "segment.part.verification-failed.json"
+    assert speech_calls == 1
+    assert output.read_bytes() == b"defective-wav"
+    assert "drei vier fuenf sechs" in report.read_text(encoding="utf-8")
+
+    config.tts.openai.model = "fehlerhaft-geaendertes-modell"
+    voice.openai_voice = "fehlerhaft-geaenderte-stimme"
+    try:
+        OpenAIBackend(config).render(
+            "Eins zwei drei vier fuenf sechs sieben acht.", voice, output
+        )
+    except RuntimeError as exc:
+        assert "bereits ein Versuch registriert" in str(exc)
+    else:
+        raise AssertionError("expected a second paid attempt to be blocked")
+
+    assert speech_calls == 1
 
 
 def test_openai_single_speaker_lines_are_grouped_without_labels(tmp_path):

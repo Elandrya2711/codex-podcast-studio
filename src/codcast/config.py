@@ -177,9 +177,19 @@ class OpenAIConfig(ConfigModel):
     model: str = "gpt-4o-mini-tts"
     voice: str = "cedar"
     response_format: Literal["wav"] = "wav"
-    max_input_chars: int = 3800
+    # Lange generative Sprachsegmente koennen trotz HTTP 200 einzelne Satzteile
+    # auslassen. Kuerzere Einheiten verhindern das weitgehend; die optionale
+    # Ruecktranskription bleibt das Sicherheitsnetz fuer den Rest.
+    max_input_chars: int = 1200
     max_output_bytes: int = 50_000_000
-    concurrency: int = 4
+    # Bei parallelen Requests koennen nach dem ersten Qualitaetsfehler bereits
+    # weitere kostenpflichtige Segmente unterwegs sein. Seriell rendern, damit
+    # der Lauf am ersten Befund wirklich stoppt.
+    concurrency: int = 1
+    verify_transcript: bool = False
+    verification_model: str = "gpt-4o-mini-transcribe"
+    verification_min_coverage: float = 0.92
+    verification_max_unmatched_words: int = 2
     instructions: str = (
         "Sprich natuerlich, ruhig und praezise auf Deutsch. "
         "Der Stil ist ein moderner, gut verstaendlicher Podcast."
@@ -517,6 +527,14 @@ def load_config(path: Path | None = None) -> AppConfig:
         config.diarize.python_executable = base_dir / config.diarize.python_executable
     if not config.diarize.model_dir.is_absolute():
         config.diarize.model_dir = base_dir / config.diarize.model_dir
+    # Referenzaufnahmen und Modelldateien gehoeren zur Konfiguration, nicht zum
+    # Arbeitsverzeichnis. Ohne das faellt ein Lauf aus einem fremden Verzeichnis
+    # erst in der TTS-Stufe um, also nach der gesamten Recherche.
+    for voice in config.tts.voices:
+        for attribute in ("speaker_wav", "kokoro_model", "kokoro_voice"):
+            value = getattr(voice, attribute)
+            if value is not None and not value.is_absolute():
+                setattr(voice, attribute, base_dir / value)
     return config
 
 
