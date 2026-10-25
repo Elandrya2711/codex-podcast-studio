@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from .audio import assemble_episode, command_available
 from .config import AppConfig, VoiceProfile, default_config_dict, load_config, write_config
-from .models import PodcastScript
+from .models import PodcastScript, ScriptLine, SpeakerSpec
 from .pipeline import PodcastGenerator
 from .progress import PodcastCancelled
 from .tts import ScriptRenderer, render_voice_sample
@@ -65,6 +68,8 @@ EFFORT_DESCRIPTIONS = {
 }
 WIZARD_DEFAULT_MIN_MINUTES = 10.0
 WIZARD_DEFAULT_MAX_MINUTES = 15.0
+SPEAK_FORMATS = ("mp3", "wav", "opus", "m4a")
+SPEAK_CHUNK_MAX_CHARS = 260
 
 
 def project_root() -> Path:
@@ -690,6 +695,201 @@ def cmd_voices_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def _speak_text(args: argparse.Namespace) -> str:
+    sources = sum(
+        value is not None and value is not False
+        for value in (getattr(args, "text", None), getattr(args, "text_file", None), getattr(args, "stdin", False))
+    )
+    if sources > 1:
+        raise SystemExit("Bitte Text, --text-file oder --stdin verwenden, nicht mehrere davon.")
+    if getattr(args, "text_file", None) is not None:
+        try:
+            text = _read_text_file(args.text_file, label="Textdatei")
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+    elif getattr(args, "stdin", False) or (getattr(args, "text", None) is None and not sys.stdin.isatty()):
+        text = sys.stdin.read().strip()
+    else:
+        text = (getattr(args, "text", None) or "").strip()
+    if not text:
+        raise SystemExit("Kein Text zum Sprechen angegeben.")
+    return text
+
+
+def _default_speak_voice(config: AppConfig) -> VoiceProfile:
+    if config.tts.voice_set:
+        members = config.tts.voice_sets.get(config.tts.voice_set, [])
+        if members:
+            selected = next((voice for voice in config.tts.voices if voice.id == members[0]), None)
+            if selected is not None:
+                return selected
+    selected = next((voice for voice in config.tts.voices if voice.backend == config.tts.backend), None)
+    if selected is not None:
+        return selected
+    if config.tts.voices:
+        return config.tts.voices[0]
+    raise SystemExit("Keine TTS-Stimme konfiguriert.")
+
+
+def _default_speak_output(output_format: str) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return Path.home() / ".local" / "share" / "codcast" / "voice-replies" / f"reply-{stamp}.{output_format}"
+
+
+def _stabilize_speak_voice(config: AppConfig, voice: VoiceProfile) -> VoiceProfile:
+    if voice.backend != "chatterbox":
+        return voice
+    stable = voice.model_copy(deep=True)
+    configured_temperature = stable.chatterbox_temperature
+    if configured_temperature is None:
+        configured_temperature = config.tts.chatterbox.temperature
+    stable.chatterbox_temperature = min(configured_temperature, 0.45)
+    config.tts.chatterbox.max_retries = max(config.tts.chatterbox.max_retries, 4)
+    config.tts.chatterbox.min_duration_ratio = max(config.tts.chatterbox.min_duration_ratio, 0.55)
+    config.tts.chatterbox.max_duration_ratio = min(config.tts.chatterbox.max_duration_ratio, 1.45)
+    return stable
+
+
+def _split_speak_text(text: str, max_chars: int = SPEAK_CHUNK_MAX_CHARS) -> list[str]:
+    if max_chars < 20:
+        raise ValueError("max_chars must be at least 20")
+    paragraphs = [" ".join(part.split()) for part in re.split(r"\n\s*\n", text) if part.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    def append_piece(piece: str) -> None:
+        nonlocal current
+        candidate = f"{current} {piece}".strip()
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = piece
+        else:
+            current = candidate
+
+    for paragraph in paragraphs:
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", paragraph) if part.strip()]
+        for sentence in sentences:
+            if len(sentence) <= max_chars:
+                append_piece(sentence)
+                continue
+            words = sentence.split()
+            piece = ""
+            for word in words:
+                candidate = f"{piece} {word}".strip()
+                if piece and len(candidate) > max_chars:
+                    append_piece(piece)
+                    piece = word
+                else:
+                    piece = candidate
+            if piece:
+                append_piece(piece)
+        if current:
+            chunks.append(current)
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _transcode_speak_output(source_wav: Path, output: Path, output_format: str) -> None:
+    if not command_available("ffmpeg"):
+        raise RuntimeError("ffmpeg fehlt; fuer komprimierte Sprachnachrichten wird ffmpeg benoetigt.")
+    codec_args = {
+        "mp3": ["-codec:a", "libmp3lame", "-b:a", "192k"],
+        "opus": ["-codec:a", "libopus", "-b:a", "96k"],
+        "m4a": ["-codec:a", "aac", "-b:a", "192k"],
+    }[output_format]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(source_wav),
+            "-af",
+            "loudnorm=I=-16:LRA=11:TP=-1.5",
+            *codec_args,
+            str(output),
+        ],
+        check=True,
+    )
+
+
+def cmd_speak(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    text = _speak_text(args)
+    if args.voice:
+        voice = next((item for item in config.tts.voices if item.id == args.voice), None)
+        if voice is None:
+            available = ", ".join(item.id for item in config.tts.voices) or "keine"
+            raise SystemExit(f"Unbekannte Stimme '{args.voice}'. Verfuegbar: {available}")
+    else:
+        voice = _default_speak_voice(config)
+    voice = _stabilize_speak_voice(config, voice)
+
+    output_format = args.format
+    output = args.output.expanduser() if args.output else _default_speak_output(output_format)
+    if output.suffix:
+        inferred = output.suffix.lstrip(".").lower()
+        if inferred not in SPEAK_FORMATS:
+            raise SystemExit(
+                f"Nicht unterstuetztes Ausgabeformat '.{inferred}'. "
+                f"Verfuegbar: {', '.join(SPEAK_FORMATS)}"
+            )
+        output_format = inferred
+    else:
+        output = output.with_suffix(f".{output_format}")
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    chunks = _split_speak_text(text)
+    if len(chunks) == 1:
+        if output_format == "wav":
+            render_voice_sample(config, voice, chunks[0], output)
+        else:
+            with tempfile.TemporaryDirectory(prefix="codcast-speak-") as temp_dir:
+                source_wav = Path(temp_dir) / "reply.wav"
+                render_voice_sample(config, voice, chunks[0], source_wav)
+                _transcode_speak_output(source_wav, output, output_format)
+    else:
+        with tempfile.TemporaryDirectory(prefix="codcast-speak-") as temp_dir:
+            run_dir = Path(temp_dir)
+            config.tts.reuse_segments = False
+            script = PodcastScript(
+                title="Voice reply",
+                topic="Voice reply",
+                target_min_minutes=0.1,
+                target_max_minutes=60.0,
+                speakers=[
+                    SpeakerSpec(
+                        id="s1",
+                        display_name=voice.display_name,
+                        role="Host",
+                        voice_profile_id=voice.id,
+                    )
+                ],
+                lines=[ScriptLine(speaker_id="s1", text=chunk) for chunk in chunks],
+            )
+            rendered = ScriptRenderer(config, {voice.id: voice}).render_script(script, run_dir)
+            final_wav, final_mp3, _duration = assemble_episode(
+                rendered,
+                run_dir,
+                config.audio,
+                pause_between_lines_sec=min(config.generation.pause_between_lines_sec, 0.22),
+                output_stem="reply",
+            )
+            if output_format == "wav":
+                shutil.copy2(final_wav, output)
+            elif output_format == "mp3":
+                shutil.copy2(final_mp3, output)
+            else:
+                _transcode_speak_output(final_wav, output, output_format)
+    print(output)
+    return 0
+
+
 def cmd_voices_import(args: argparse.Namespace) -> int:
     config_path = args.config
     config = load_config(config_path)
@@ -1097,6 +1297,16 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     )
     voices_extract.add_argument("--skip-tail", type=float, default=0.0, help="Sekunden am Ende ignorieren")
     voices_extract.set_defaults(func=cmd_voices_extract)
+
+    speak = sub.add_parser("speak", help="Render a single spoken reply without podcast research")
+    add_common_config_arg(speak)
+    speak.add_argument("text", nargs="?", help="Text to speak; quote it when it contains spaces")
+    speak.add_argument("--text-file", type=Path, default=None, help="Read the spoken text from a UTF-8 file")
+    speak.add_argument("--stdin", action="store_true", help="Read the spoken text from standard input")
+    speak.add_argument("--voice", default=None, help="Voice profile ID; default is the first voice in the active set")
+    speak.add_argument("--output", type=Path, default=None, help="Output path; its suffix selects the format")
+    speak.add_argument("--format", choices=list(SPEAK_FORMATS), default="mp3", help="Default output format")
+    speak.set_defaults(func=cmd_speak)
 
     rerender = sub.add_parser("rerender", help="Render audio again from an existing script.json without research")
     add_common_config_arg(rerender)
