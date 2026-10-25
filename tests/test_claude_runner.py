@@ -70,9 +70,11 @@ def test_claude_command_toggles_web_search(tmp_path: Path):
 
     live = runner.build_command(schema=schema_for("research"))
     assert live[live.index("--tools") + 1] == "WebSearch"
+    assert live[live.index("--allowedTools") + 1] == "WebSearch"
 
     cached = runner.build_command(schema=schema_for("research"), live_search=False)
     assert cached[cached.index("--tools") + 1] == ""
+    assert "--allowedTools" not in cached
 
 
 def test_claude_command_isolates_user_environment(tmp_path: Path):

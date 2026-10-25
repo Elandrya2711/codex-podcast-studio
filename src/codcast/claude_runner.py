@@ -48,6 +48,11 @@ class ClaudeRunner:
         cmd.extend(["--output-format", "stream-json", "--verbose"])
         use_live_search = self.config.live_search if live_search is None else live_search
         cmd.extend(["--tools", "WebSearch" if use_live_search else ""])
+        if use_live_search:
+            # Print mode has no one to approve the tool: without this every
+            # search comes back as "permission not granted" and the research
+            # silently falls back to model knowledge.
+            cmd.extend(["--allowedTools", "WebSearch"])
         if self.config.isolate:
             # Without these the user's global MCP servers, hooks and skills leak
             # into the run: --tools alone does not filter MCP tools.
