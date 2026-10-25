@@ -170,6 +170,35 @@ class ChatterboxConfig(ConfigModel):
         return Path(str(value)).expanduser()
 
 
+class PhononConfig(ConfigModel):
+    """Gradium Phonon (`ptts`) in einer eigenen venv (`codcast setup-phonon`).
+
+    Laeuft auf der CPU, ohne PyTorch: die Wahl fuer Rechner ohne GPU. Lizenz
+    der Gewichte ist CC BY-NC 4.0, also nur nicht-kommerziell.
+    """
+
+    python_executable: Path = Path(".venv-phonon/bin/python")
+    # Lokales Modellverzeichnis oder "hf://owner/name@revision". Das Hub-Repo
+    # ist gated: Bedingungen auf huggingface.co akzeptieren und `hf auth login`
+    # oder HF_TOKEN setzen. Die Revision ist fest, damit ein Lauf reproduzierbar
+    # bleibt.
+    model: str = "hf://gradium/phonon-40m-multilingual@1537ce46c64f42903e0d608b132ccb073dac46d2"
+    lang: str = "de"
+    quant: str = "q8_0"
+    # None: ptts waehlt selbst (alle Kerne). In einem Container mit CPU-Limit
+    # auf das Limit setzen, sonst bremsen sich die Threads gegenseitig aus.
+    threads: int | None = None
+    # None: Modell-Default (0.3).
+    temperature: float | None = None
+    startup_timeout_sec: int = 300
+    timeout_sec: int = 300
+
+    @field_validator("python_executable", mode="before")
+    @classmethod
+    def expand_python_executable(cls, value: object) -> object:
+        return Path(str(value)).expanduser()
+
+
 class OpenAIConfig(ConfigModel):
     env_file: Path = Path(".env.tts.local")
     api_key_env: str = "OPENAI_TTS_API_KEY"
@@ -231,7 +260,7 @@ class FishConfig(ConfigModel):
 class VoiceProfile(ConfigModel):
     id: str
     display_name: str
-    backend: Literal["chatterbox", "fish", "kokoro", "openai", "xtts"]
+    backend: Literal["chatterbox", "fish", "kokoro", "openai", "phonon", "xtts"]
     language: str = "de-DE"
     license: str = "unknown"
     speaker_wav: Path | None = None
@@ -239,6 +268,8 @@ class VoiceProfile(ConfigModel):
     fish_reference_id: str | None = None
     openai_voice: str | None = None
     openai_instructions: str | None = None
+    # Eingebaute Phonon-Stimme, etwa "Henrik" oder "Nele".
+    phonon_voice: str | None = None
     kokoro_model: Path | None = None
     kokoro_voice: Path | None = None
     # Pro Stimme nachschaerfen, ohne die anderen Stimmen anzufassen.
@@ -257,8 +288,8 @@ class VoiceProfile(ConfigModel):
 
 
 class TTSConfig(ConfigModel):
-    quality: Literal["best", "chatterbox", "fast", "openai", "xtts"] = "best"
-    backend: Literal["chatterbox", "fish", "kokoro", "openai", "xtts"] = "chatterbox"
+    quality: Literal["best", "chatterbox", "fast", "openai", "phonon", "xtts"] = "best"
+    backend: Literal["chatterbox", "fish", "kokoro", "openai", "phonon", "xtts"] = "chatterbox"
     language: str = "de"
     allow_voice_reuse: bool = False
     # Benannte Besetzungen: ohne das gewinnen immer die ersten passenden Profile,
@@ -284,6 +315,7 @@ class TTSConfig(ConfigModel):
     gpu_oom_free_ollama: bool = False
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     chatterbox: ChatterboxConfig = Field(default_factory=ChatterboxConfig)
+    phonon: PhononConfig = Field(default_factory=PhononConfig)
     kokoro: KokoroConfig = Field(default_factory=KokoroConfig)
     xtts: XttsConfig = Field(default_factory=XttsConfig)
     fish: FishConfig = Field(default_factory=FishConfig)
@@ -410,6 +442,7 @@ def default_config_dict() -> dict[str, Any]:
             "allow_voice_reuse": False,
             "openai": OpenAIConfig().model_dump(mode="json"),
             "chatterbox": ChatterboxConfig().model_dump(mode="json"),
+            "phonon": PhononConfig().model_dump(mode="json"),
             "kokoro": KokoroConfig().model_dump(mode="json"),
             "xtts": XttsConfig().model_dump(mode="json"),
             "fish": FishConfig().model_dump(mode="json"),
@@ -456,6 +489,24 @@ def default_config_dict() -> dict[str, Any]:
                         "Sprich als analytische deutsche Podcast-Stimme: warm, praezise "
                         "und mit sauberer Betonung technischer Begriffe."
                     ),
+                    "speed": 1.0,
+                },
+                {
+                    "id": "phonon-henrik",
+                    "display_name": "Henrik",
+                    "backend": "phonon",
+                    "language": "de-DE",
+                    "license": "cc-by-nc-4.0",
+                    "phonon_voice": "Henrik",
+                    "speed": 1.0,
+                },
+                {
+                    "id": "phonon-nele",
+                    "display_name": "Nele",
+                    "backend": "phonon",
+                    "language": "de-DE",
+                    "license": "cc-by-nc-4.0",
+                    "phonon_voice": "Nele",
                     "speed": 1.0,
                 },
                 {
@@ -523,6 +574,12 @@ def load_config(path: Path | None = None) -> AppConfig:
     # anderen Arbeitsverzeichnis laeuft.
     if not config.tts.chatterbox.python_executable.is_absolute():
         config.tts.chatterbox.python_executable = base_dir / config.tts.chatterbox.python_executable
+    if not config.tts.phonon.python_executable.is_absolute():
+        config.tts.phonon.python_executable = base_dir / config.tts.phonon.python_executable
+    # Ein lokales Phonon-Modell ebenso; "hf://..." bleibt unveraendert.
+    if "://" not in config.tts.phonon.model:
+        model_dir = Path(config.tts.phonon.model).expanduser()
+        config.tts.phonon.model = str(model_dir if model_dir.is_absolute() else base_dir / model_dir)
     if not config.diarize.python_executable.is_absolute():
         config.diarize.python_executable = base_dir / config.diarize.python_executable
     if not config.diarize.model_dir.is_absolute():

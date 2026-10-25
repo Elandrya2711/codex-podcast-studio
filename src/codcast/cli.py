@@ -23,10 +23,12 @@ from .voices import backend_for_quality, select_voice_profiles, voice_map
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-QUALITY_CHOICES = ("best", "chatterbox", "fast", "openai", "xtts")
+QUALITY_CHOICES = ("best", "chatterbox", "fast", "openai", "phonon", "xtts")
 RESEARCH_DEPTH_CHOICES = ("standard", "deep", "dossier")
 LLM_PROVIDER_CHOICES = ("claude", "codex")
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+# Fest gepinnt: die Phonon-Unterstuetzung kam erst mit 0.4.0 und aendert sich noch.
+PHONON_PACKAGE = "ptts==0.4.1"
 # Bewusst ungated: kein HuggingFace-Token noetig, anders als bei pyannote.
 DIARIZE_PACKAGES = ("torch", "torchaudio", "speechbrain", "silero-vad", "scikit-learn", "soundfile", "numpy<2")
 # Short aliases that resolve to pinned model IDs, so a run stays reproducible.
@@ -42,6 +44,7 @@ QUALITY_DESCRIPTIONS = {
     "chatterbox": "lokal auf der GPU, klont Referenzstimmen, kostenlos",
     "fast": "Kokoro, lokal und schnell",
     "openai": "OpenAI TTS, kostet Geld, benoetigt OPENAI_TTS_API_KEY",
+    "phonon": "Phonon, lokal auf der CPU ohne GPU, feste Stimmen, nicht-kommerziell",
     "xtts": "eigene XTTS-Referenzstimmen",
 }
 RESEARCH_DEPTH_DESCRIPTIONS = {
@@ -671,12 +674,15 @@ def cmd_voices_list(args: argparse.Namespace) -> int:
     for voice in config.tts.voices:
         if voice.backend == "kokoro":
             path = voice.kokoro_model
-        elif voice.backend in {"fish", "xtts"}:
+        elif voice.backend in {"chatterbox", "fish", "xtts"}:
             path = voice.speaker_wav
         else:
             path = None
         exists = bool(path and path.exists())
-        location = "cloud" if path is None else str(path)
+        if voice.backend == "phonon":
+            location = f"builtin:{voice.phonon_voice}"
+        else:
+            location = "cloud" if path is None else str(path)
         print(
             f"{voice.id}\t{voice.display_name}\t{voice.backend}\t{voice.language}"
             f"\tlicense={voice.license}\texists={exists}\t{location}"
@@ -1129,7 +1135,8 @@ def cmd_setup_chatterbox(args: argparse.Namespace) -> int:
         return 1
 
     steps = [
-        (["uv", "venv", "--python", "3.12", str(venv_dir)], "venv anlegen"),
+        # Ein zweiter Aufruf soll nachinstallieren, nicht an der vorhandenen venv scheitern.
+        *([] if python_executable.exists() else [(["uv", "venv", "--python", "3.12", str(venv_dir)], "venv anlegen")]),
         # setuptools<81 wird gebraucht, weil resemble-perth (Wasserzeichen) pkg_resources importiert.
         (["uv", "pip", "install", "--python", str(python_executable), "chatterbox-tts", "setuptools<81"], "Pakete installieren"),
     ]
@@ -1156,6 +1163,47 @@ def cmd_setup_chatterbox(args: argparse.Namespace) -> int:
     print("     uv run codcast voices import --backend chatterbox --name chatterbox-host-m --wav /pfad/maennlich.wav")
     print("     uv run codcast voices import --backend chatterbox --name chatterbox-host-f --wav /pfad/weiblich.wav")
     print("  Danach: uv run codcast voices test chatterbox-host-m")
+    return 0
+
+
+def cmd_setup_phonon(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    python_executable = config.tts.phonon.python_executable
+    venv_dir = python_executable.parent.parent
+
+    print("Phonon 40M (Gradium, lokal auf der CPU, keine GPU noetig)")
+    print("  Lizenz der Gewichte: CC BY-NC 4.0, nur nicht-kommerzielle Nutzung.")
+    print(f"  venv: {venv_dir}")
+    if not command_available("uv"):
+        print("  uv wurde nicht gefunden. Installiere uv oder lege die venv manuell an:")
+        print(f"    python3.12 -m venv {venv_dir}")
+        print(f"    {venv_dir}/bin/pip install {PHONON_PACKAGE}")
+        return 1
+
+    steps = [
+        *([] if python_executable.exists() else [(["uv", "venv", "--python", "3.12", str(venv_dir)], "venv anlegen")]),
+        (["uv", "pip", "install", "--python", str(python_executable), PHONON_PACKAGE], "Pakete installieren"),
+    ]
+    for command, label in steps:
+        print(f"  {label}: {' '.join(command)}")
+        result = subprocess.run(command, cwd=project_root())
+        if result.returncode != 0:
+            print(f"  Abbruch: {label} ist fehlgeschlagen.")
+            return result.returncode
+
+    check = subprocess.run([str(python_executable), "-I", "-c", "import ptts; print(ptts.__version__)"], capture_output=True, text=True)
+    if check.returncode != 0:
+        print("  Installationspruefung fehlgeschlagen:")
+        print(check.stderr.strip()[-800:])
+        return check.returncode
+
+    print(f"  Pruefung: ok (ptts {check.stdout.strip()})")
+    print(f"  Modell: {config.tts.phonon.model}")
+    if config.tts.phonon.model.startswith("hf://"):
+        print("  Das Hub-Repo ist gated. Einmal die Bedingungen auf huggingface.co akzeptieren,")
+        print("  dann `hf auth login` oder HF_TOKEN setzen. Der erste Lauf laedt ca. 75 MB.")
+        print("  Alternativ tts.phonon.model auf ein lokales Modellverzeichnis setzen.")
+    print("  Danach: uv run codcast voices test phonon-henrik")
     return 0
 
 
@@ -1337,6 +1385,10 @@ def build_parser(prog: str = "codcast") -> argparse.ArgumentParser:
     setup_chatterbox = sub.add_parser("setup-chatterbox", help="Install the local Chatterbox voice environment")
     add_common_config_arg(setup_chatterbox)
     setup_chatterbox.set_defaults(func=cmd_setup_chatterbox)
+
+    setup_phonon = sub.add_parser("setup-phonon", help="Install the local Phonon voice environment (CPU, no GPU)")
+    add_common_config_arg(setup_phonon)
+    setup_phonon.set_defaults(func=cmd_setup_phonon)
 
     setup_diarize = sub.add_parser("setup-diarize", help="Install the local speaker-separation environment")
     add_common_config_arg(setup_diarize)

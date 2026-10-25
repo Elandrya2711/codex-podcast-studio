@@ -145,6 +145,25 @@ Fish bleibt als optionaler Premium-/Experimentierpfad mit kuratierten Referenzst
 
 Diese Referenzdateien muessen bewusst gesetzt werden. Der Premium-Pfad hat keinen Kokoro- oder Piper-Fallback.
 
+## Phonon Setup (lokal, nur CPU)
+
+Phonon 40M von Gradium laeuft ohne GPU und ohne PyTorch: die Laufzeit ist eine Rust-Erweiterung im Paket `ptts`. Das Modell belegt rund 400 MB RAM und rendert auf der CPU etwa achtmal schneller als Echtzeit (gemessen: 4:22 Minuten Dialog in 32 Sekunden). Damit ist es der Weg fuer Rechner und Container ohne Grafikkarte.
+
+```bash
+uv run codcast setup-phonon
+uv run codcast voices test phonon-henrik
+uv run codcast generate "Thema" --speakers 2 --quality phonon
+```
+
+`setup-phonon` legt `.venv-phonon` an und installiert `ptts==0.4.1`. Die Stimmen sind fest eingebaut, es gibt nichts zu klonen und keine Referenzaufnahme. Die Standardkonfiguration bringt `phonon-henrik` (Henrik) und `phonon-nele` (Nele) mit; weitere deutsche Stimmen sind Jette, Annika, Jule, Lotta, Josefine, Anton, Mirko, Mats, Leon und Mika, eingetragen als Profil mit `backend: phonon` und `phonon_voice: <Name>`.
+
+Zwei Dinge sind anders als bei den anderen Backends:
+
+- **Lizenz:** Die Gewichte stehen unter CC BY-NC 4.0. Damit erzeugte Folgen sind nur fuer nicht-kommerzielle Nutzung.
+- **Gated:** `gradium/phonon-40m-multilingual` auf Hugging Face verlangt, dass man die Bedingungen akzeptiert. Danach `hf auth login` oder `HF_TOKEN`, und der erste Lauf laedt rund 75 MB. Alternativ zeigt `tts.phonon.model` auf ein lokales Verzeichnis mit `config.json`, `tokenizer.json` und `model.q8.gguf`.
+
+Zahlen und Kuerzel normalisiert `ptts` selbst. `normalize_for_tts` laeuft hier bewusst nicht davor: aus `1.299` macht es "eins.zweihundert...", das ist schlechter als Phonons eigene Lesart. In einem Container mit CPU-Limit `tts.phonon.threads` auf das Limit setzen, sonst bremsen sich die Threads gegenseitig.
+
 ## Fish S2 Pro Setup
 
 ```bash
@@ -421,7 +440,7 @@ uv run codcast generate "Thema" \
   --speakers 2
 ```
 
-Hinweis: `--quality best` nutzt den in `tts.backend` konfigurierten Pfad, standardmaessig das lokale Chatterbox. `--quality chatterbox` erzwingt den lokalen Pfad, `--quality openai` erzwingt OpenAI (kostet Geld), `--quality fast` nutzt Kokoro/Kikiri. `--quality xtts` bleibt fuer eigene XTTS-Referenzstimmen verfuegbar. Im Wizard zeigt die Zeile `Audio-Qualitaet` immer das effektive Backend, damit `best` nicht unbemerkt Geld kostet.
+Hinweis: `--quality best` nutzt den in `tts.backend` konfigurierten Pfad, standardmaessig das lokale Chatterbox. `--quality chatterbox` erzwingt den lokalen Pfad, `--quality openai` erzwingt OpenAI (kostet Geld), `--quality fast` nutzt Kokoro/Kikiri. `--quality phonon` nutzt Phonon auf der CPU. `--quality xtts` bleibt fuer eigene XTTS-Referenzstimmen verfuegbar. Im Wizard zeigt die Zeile `Audio-Qualitaet` immer das effektive Backend, damit `best` nicht unbemerkt Geld kostet.
 
 ### Gemessener Vergleich der Audiopfade
 

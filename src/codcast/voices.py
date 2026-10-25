@@ -25,6 +25,8 @@ def backend_for_quality(config: AppConfig, quality: str | None = None) -> str:
         return "kokoro"
     if selected == "openai":
         return "openai"
+    if selected == "phonon":
+        return "phonon"
     if selected == "xtts":
         return "xtts"
     return config.tts.backend
@@ -91,6 +93,11 @@ def select_voice_profiles(
         raise ValueError(
             f"{speaker_count} Fish voice profile(s) requested, but only {len(profiles)} configured. "
             "Import premium reference voices with `codcast voices import --backend fish ...`."
+        )
+    if backend == "phonon":
+        raise ValueError(
+            f"{speaker_count} Phonon voice profile(s) requested, but only {len(profiles)} configured. "
+            "Add profiles with backend: phonon and phonon_voice (e.g. Henrik, Nele) to podcast.yml."
         )
     if backend == "openai":
         raise ValueError(

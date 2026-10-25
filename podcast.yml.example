@@ -148,6 +148,20 @@ tts:
     chars_per_second: 15.0
     startup_timeout_sec: 600
     timeout_sec: 300
+  phonon:
+    # Lokal auf der CPU, keine GPU noetig. Eigene venv, angelegt von
+    # `codcast setup-phonon`. Gewichte unter CC BY-NC 4.0 (nicht-kommerziell).
+    python_executable: .venv-phonon/bin/python
+    # Lokales Modellverzeichnis oder hf://owner/name@revision. Das Hub-Repo ist
+    # gated: Bedingungen akzeptieren, dann `hf auth login` oder HF_TOKEN.
+    model: hf://gradium/phonon-40m-multilingual@1537ce46c64f42903e0d608b132ccb073dac46d2
+    lang: de
+    quant: q8_0
+    # null: alle Kerne. In einem Container mit CPU-Limit auf das Limit setzen.
+    threads: null
+    temperature: null
+    startup_timeout_sec: 300
+    timeout_sec: 300
   openai:
     env_file: .env.tts.local
     api_key_env: OPENAI_TTS_API_KEY
@@ -208,6 +222,22 @@ tts:
     # Nicht gesetzte Werte kommen aus tts.chatterbox.
     # chatterbox_temperature: 0.45
     # chatterbox_cfg_weight: 0.4
+    speed: 1.0
+  # Phonon bringt feste Stimmen mit, es wird nichts geklont. Deutsch:
+  # Nele, Jette, Annika, Jule, Lotta, Josefine, Anton, Mirko, Mats, Henrik, Leon, Mika.
+  - id: phonon-henrik
+    display_name: Henrik
+    backend: phonon
+    language: de-DE
+    license: cc-by-nc-4.0
+    phonon_voice: Henrik
+    speed: 1.0
+  - id: phonon-nele
+    display_name: Nele
+    backend: phonon
+    language: de-DE
+    license: cc-by-nc-4.0
+    phonon_voice: Nele
     speed: 1.0
   - id: openai-cedar
     display_name: Cedar

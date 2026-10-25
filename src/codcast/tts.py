@@ -128,15 +128,16 @@ class KokoroBackend(TTSBackend):
         sf.write(output_path, audio, self.sample_rate)
 
 
-class ChatterboxBackend(TTSBackend):
-    """Chatterbox Multilingual ueber einen persistenten Worker-Prozess.
+class WorkerBackend(TTSBackend):
+    """Basis fuer Backends mit persistentem Worker-Prozess in einer eigenen venv.
 
-    Der Worker laeuft in einer eigenen venv und haelt das Modell im VRAM, damit
-    nicht jedes Segment die 3 GB Gewichte neu laedt. Kommuniziert wird mit einer
-    JSON-Zeile pro Job (siehe workers/chatterbox_worker.py).
+    Der Worker laedt das Modell einmal und rendert dann ein Segment pro
+    JSON-Zeile (Protokoll siehe workers/chatterbox_worker.py). Unterklassen
+    liefern Startbefehl, Zeitlimits und den Job.
     """
 
-    WORKER = Path(__file__).parent / "workers" / "chatterbox_worker.py"
+    LABEL = "Worker"
+    WORKER: Path
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -146,53 +147,52 @@ class ChatterboxBackend(TTSBackend):
         self._sample_rate: int | None = None
         self._next_id = 0
         self._lock = threading.Lock()
-        # Segmente, die auch nach den Wiederholungen auffaellig blieben.
-        self.warnings: list[str] = []
         atexit.register(self.close)
 
-    def _start_worker(self) -> None:
-        chatterbox = self.config.tts.chatterbox
-        python = chatterbox.python_executable
-        if not python.exists():
-            raise RuntimeError(
-                f"Chatterbox-Python nicht gefunden: {python}. "
-                "Einmalig einrichten mit `uv run codcast setup-chatterbox`, "
-                "oder tts.chatterbox.python_executable in podcast.yml anpassen."
-            )
-        if not self.WORKER.exists():
-            raise RuntimeError(f"Chatterbox-Worker fehlt: {self.WORKER}")
+    def _worker_command(self) -> list[str]:
+        raise NotImplementedError
 
+    def _startup_timeout_sec(self) -> int:
+        raise NotImplementedError
+
+    def _job_timeout_sec(self) -> int:
+        raise NotImplementedError
+
+    def _start_worker(self) -> None:
+        if not self.WORKER.exists():
+            raise RuntimeError(f"{self.LABEL}-Worker fehlt: {self.WORKER}")
+        self._events = queue.Queue()
         self._process = subprocess.Popen(
-            [str(python), "-u", str(self.WORKER), chatterbox.device],
+            self._worker_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-        threading.Thread(target=self._read_events, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        threading.Thread(target=self._read_events, args=(self._process, self._events), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(self._process,), daemon=True).start()
 
-        ready = self._await_event(chatterbox.startup_timeout_sec, "Modellstart")
+        ready = self._await_event(self._startup_timeout_sec(), "Modellstart")
         if ready.get("event") != "ready":
-            raise RuntimeError(f"Chatterbox-Worker meldete kein ready: {ready}. {self._log_hint()}")
+            raise RuntimeError(f"{self.LABEL}-Worker meldete kein ready: {ready}. {self._log_hint()}")
         self._sample_rate = ready.get("sample_rate")
 
-    def _read_events(self) -> None:
-        assert self._process is not None and self._process.stdout is not None
-        for line in self._process.stdout:
+    def _read_events(self, process: subprocess.Popen[str], events: queue.Queue[dict | None]) -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
             line = line.strip()
             if not line:
                 continue
             try:
-                self._events.put(json.loads(line))
+                events.put(json.loads(line))
             except json.JSONDecodeError:
                 self._stderr_tail.append(f"stdout: {line[:200]}")
-        self._events.put(None)
+        events.put(None)
 
-    def _read_stderr(self) -> None:
-        assert self._process is not None and self._process.stderr is not None
-        for line in self._process.stderr:
+    def _read_stderr(self, process: subprocess.Popen[str]) -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
             self._stderr_tail.append(line.rstrip())
             del self._stderr_tail[:-60]
 
@@ -206,12 +206,77 @@ class ChatterboxBackend(TTSBackend):
             event = self._events.get(timeout=timeout_sec)
         except queue.Empty as exc:
             self.close()
-            raise RuntimeError(f"Chatterbox-Worker antwortete nicht ({what}, {timeout_sec}s). {self._log_hint()}") from exc
+            raise RuntimeError(f"{self.LABEL}-Worker antwortete nicht ({what}, {timeout_sec}s). {self._log_hint()}") from exc
         if event is None:
             code = self._process.poll() if self._process else None
             self.close()
-            raise RuntimeError(f"Chatterbox-Worker beendet (exit {code}) waehrend {what}. {self._log_hint()}")
+            raise RuntimeError(f"{self.LABEL}-Worker beendet (exit {code}) waehrend {what}. {self._log_hint()}")
         return event
+
+    def _run_job(self, job: dict) -> dict:
+        """Schickt einen Job und wartet auf dessen done-Event."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._start_worker()
+            assert self._process is not None and self._process.stdin is not None
+            self._next_id += 1
+            job_id = self._next_id
+            self._process.stdin.write(json.dumps({"id": job_id, **job}) + "\n")
+            self._process.stdin.flush()
+
+            while True:
+                event = self._await_event(self._job_timeout_sec(), f"Segment {job_id}")
+                if event.get("id") == job_id:
+                    break
+            if event.get("event") != "done":
+                raise RuntimeError(
+                    f"{self.LABEL} konnte Segment nicht rendern: {event.get('message')}. {self._log_hint()}"
+                )
+            return event
+
+    def close(self) -> None:
+        process, self._process = self._process, None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=10)
+        except Exception:
+            process.kill()
+
+
+class ChatterboxBackend(WorkerBackend):
+    """Chatterbox Multilingual ueber einen persistenten Worker-Prozess.
+
+    Der Worker haelt das Modell im VRAM, damit nicht jedes Segment die 3 GB
+    Gewichte neu laedt.
+    """
+
+    LABEL = "Chatterbox"
+    WORKER = Path(__file__).parent / "workers" / "chatterbox_worker.py"
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(config)
+        # Segmente, die auch nach den Wiederholungen auffaellig blieben.
+        self.warnings: list[str] = []
+
+    def _worker_command(self) -> list[str]:
+        chatterbox = self.config.tts.chatterbox
+        python = chatterbox.python_executable
+        if not python.exists():
+            raise RuntimeError(
+                f"Chatterbox-Python nicht gefunden: {python}. "
+                "Einmalig einrichten mit `uv run codcast setup-chatterbox`, "
+                "oder tts.chatterbox.python_executable in podcast.yml anpassen."
+            )
+        return [str(python), "-u", str(self.WORKER), chatterbox.device]
+
+    def _startup_timeout_sec(self) -> int:
+        return self.config.tts.chatterbox.startup_timeout_sec
+
+    def _job_timeout_sec(self) -> int:
+        return self.config.tts.chatterbox.timeout_sec
 
     def render(self, text: str, voice: VoiceProfile, output_path: Path) -> None:
         if not voice.speaker_wav:
@@ -241,14 +306,8 @@ class ChatterboxBackend(TTSBackend):
 
     def _render_once(self, spoken: str, voice: VoiceProfile, output_path: Path) -> float:
         chatterbox = self.config.tts.chatterbox
-        with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                self._start_worker()
-            assert self._process is not None and self._process.stdin is not None
-            self._next_id += 1
-            job_id = self._next_id
-            job = {
-                "id": job_id,
+        event = self._run_job(
+            {
                 "text": spoken,
                 "reference": str(voice.speaker_wav),
                 "output_path": str(output_path),
@@ -258,29 +317,61 @@ class ChatterboxBackend(TTSBackend):
                 "temperature": _first_set(voice.chatterbox_temperature, chatterbox.temperature),
                 "repetition_penalty": chatterbox.repetition_penalty,
             }
-            self._process.stdin.write(json.dumps(job) + "\n")
-            self._process.stdin.flush()
+        )
+        return float(event.get("seconds") or 0.0)
 
-            while True:
-                event = self._await_event(chatterbox.timeout_sec, f"Segment {job_id}")
-                if event.get("id") == job_id:
-                    break
-            if event.get("event") != "done":
-                raise RuntimeError(
-                    f"Chatterbox konnte Segment nicht rendern: {event.get('message')}. {self._log_hint()}"
-                )
-            return float(event.get("seconds") or 0.0)
 
-    def close(self) -> None:
-        process, self._process = self._process, None
-        if process is None or process.poll() is not None:
-            return
-        try:
-            if process.stdin is not None:
-                process.stdin.close()
-            process.wait(timeout=10)
-        except Exception:
-            process.kill()
+class PhononBackend(WorkerBackend):
+    """Gradium Phonon (`ptts`) auf der CPU ueber einen persistenten Worker.
+
+    Kein PyTorch und keine GPU: das Modell hat 40M Parameter, belegt rund
+    400 MB RAM und rendert schneller als Echtzeit. Die Stimmen sind fest
+    eingebaut (Henrik, Nele, ...), es wird nichts geklont. Zahlen und
+    Kuerzel normalisiert ptts selbst, normalize_for_tts davor macht es
+    schlechter ("1.299" wird zu "eins.zweihundert...").
+    """
+
+    LABEL = "Phonon"
+    WORKER = Path(__file__).parent / "workers" / "phonon_worker.py"
+
+    def _worker_command(self) -> list[str]:
+        phonon = self.config.tts.phonon
+        python = phonon.python_executable
+        if not python.exists():
+            raise RuntimeError(
+                f"Phonon-Python nicht gefunden: {python}. "
+                "Einmalig einrichten mit `uv run codcast setup-phonon`, "
+                "oder tts.phonon.python_executable in podcast.yml anpassen."
+            )
+        settings = {
+            "model": phonon.model,
+            "lang": phonon.lang,
+            "quant": phonon.quant,
+            "threads": phonon.threads,
+        }
+        # -I: der Worker darf nichts aus dem Arbeitsverzeichnis importieren.
+        return [str(python), "-I", "-u", str(self.WORKER), json.dumps(settings)]
+
+    def _startup_timeout_sec(self) -> int:
+        return self.config.tts.phonon.startup_timeout_sec
+
+    def _job_timeout_sec(self) -> int:
+        return self.config.tts.phonon.timeout_sec
+
+    def render(self, text: str, voice: VoiceProfile, output_path: Path) -> None:
+        if not voice.phonon_voice:
+            raise ValueError(f"Phonon-Stimme {voice.id} braucht phonon_voice, etwa Henrik oder Nele.")
+        phonon = self.config.tts.phonon
+        self._run_job(
+            {
+                "text": text,
+                "voice": voice.phonon_voice,
+                "output_path": str(output_path),
+                "temperature": phonon.temperature,
+            }
+        )
+        if voice.speed != 1.0:
+            _apply_tempo(output_path, voice.speed)
 
 
 def _first_set(voice_value: float | None, config_value: float) -> float:
@@ -512,6 +603,8 @@ def backend_for_voice(config: AppConfig, voice: VoiceProfile) -> TTSBackend:
         return OpenAIBackend(config)
     if voice.backend == "xtts":
         return XttsBackend(config)
+    if voice.backend == "phonon":
+        return PhononBackend(config)
     raise ValueError(f"unsupported TTS backend: {voice.backend}")
 
 
