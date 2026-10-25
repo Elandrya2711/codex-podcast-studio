@@ -29,6 +29,21 @@ PHASE_LABELS = [
 ]
 
 
+def one_line(text: str, width: int) -> str:
+    """Kuerzt einen Text auf genau eine Zeile.
+
+    Ein Thema darf eine ganze Briefing-Datei sein (`--topic-file`). Rich
+    umbricht so etwas im Kopfbereich auf hunderte Zeilen und schiebt damit
+    Fortschritt, Schritte und Logs aus dem Bild.
+    """
+    single = " ".join(text.split())
+    if width < 4:
+        return ""
+    if len(single) <= width:
+        return single
+    return single[: width - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
+
+
 @dataclass
 class TuiState:
     topic: str
@@ -185,9 +200,12 @@ class PodcastTui:
         else:
             log_table.add_row("[dim]Noch keine Logs.[/dim]")
 
-        footer_lines = [f"Thema: {topic}", f"Laufzeit: {elapsed:0.1f}s"]
+        # Panelrahmen und Innenabstand kosten je zwei Spalten, das laengste
+        # Praefix ("Thema: ") sieben.
+        line_width = max(self.console.width - 11, 20)
+        footer_lines = [f"Thema: {one_line(topic, line_width)}", f"Laufzeit: {elapsed:0.1f}s"]
         if run_path:
-            footer_lines.append(f"Run: {run_path}")
+            footer_lines.append(f"Run: {one_line(run_path, line_width)}")
         if cancelled:
             footer_lines.append("Status: Abbruch angefordert")
         if error:
